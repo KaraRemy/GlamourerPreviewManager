@@ -1,0 +1,16 @@
+{
+  "Author": "Tomok2404",
+  "Name": "Glamourer Preview Manager",
+  "Punchline": "Manage and grab preview/cover images for local Glamourer designs.",
+  "Description": "A helper tool to easily attach local, XIVModArchive, direct URL preview/cover images, or take cropped screenshots of your characters to attach to your Glamourer designs.",
+  "ApplicableVersion": "any",
+  "Tags": [
+    "glamourer",
+    "preview",
+    "image",
+    "manager",
+    "design"
+  ],
+  "DalamudApiLevel": 15,
+  "Version": "0.0.0.2"
+}
