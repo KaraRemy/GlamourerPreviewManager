@@ -39,6 +39,9 @@ internal class ImGuiHookManager : IDisposable
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate byte TreeNodeExPtrDelegate(IntPtr ptr_id, int flags, IntPtr fmt);
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate byte TableNextColumnDelegate();
+
     private Hook<ButtonDelegate>? buttonHook;
     private Hook<ButtonExDelegate>? buttonExHook;
     private Hook<BeginDelegate>? beginHook;
@@ -48,6 +51,7 @@ internal class ImGuiHookManager : IDisposable
     private Hook<TreeNodeExStrDelegate>? treeNodeExStrHook;
     private Hook<TreeNodeExStrStrDelegate>? treeNodeExStrStrHook;
     private Hook<TreeNodeExPtrDelegate>? treeNodeExPtrHook;
+    private Hook<TableNextColumnDelegate>? tableNextColumnHook;
 
     [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true, SetLastError = true)]
     private static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
@@ -152,6 +156,13 @@ internal class ImGuiHookManager : IDisposable
                 treeNodeExPtrHook = Plugin.GameInteropProvider.HookFromAddress<TreeNodeExPtrDelegate>(igTreeNodeExPtrAddr, TreeNodeExPtrDetour);
                 treeNodeExPtrHook.Enable();
             }
+
+            var igTableNextColumnAddr = GetProcAddress(moduleHandle, "igTableNextColumn");
+            if (igTableNextColumnAddr != IntPtr.Zero)
+            {
+                tableNextColumnHook = Plugin.GameInteropProvider.HookFromAddress<TableNextColumnDelegate>(igTableNextColumnAddr, TableNextColumnDetour);
+                tableNextColumnHook.Enable();
+            }
         }
         catch (Exception ex)
         {
@@ -179,6 +190,8 @@ internal class ImGuiHookManager : IDisposable
         treeNodeExStrStrHook = null;
         treeNodeExPtrHook?.Dispose();
         treeNodeExPtrHook = null;
+        tableNextColumnHook?.Dispose();
+        tableNextColumnHook = null;
     }
 
     private byte ButtonDetour(IntPtr labelPtr, Vector2 size)
@@ -373,6 +386,19 @@ internal class ImGuiHookManager : IDisposable
             Plugin.Log.Error($"Error in TreeNodeExPtrDetour: {ex}");
         }
         return result;
+    }
+
+    private byte TableNextColumnDetour()
+    {
+        try
+        {
+            plugin.CheckAndDrawDeferredUI();
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Error($"Error in TableNextColumnDetour: {ex}");
+        }
+        return tableNextColumnHook != null ? tableNextColumnHook.Original() : (byte)0;
     }
 
     private static string GetUtf8String(IntPtr ptr)

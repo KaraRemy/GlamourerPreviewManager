@@ -46,6 +46,8 @@ public sealed class Plugin : IDalamudPlugin
     private Guid activeSelectedDesignId = Guid.Empty;
     private int lastSeenDesignFrame = -1;
     private string currentWindowName = string.Empty;
+    private readonly Stack<string> windowStack = new();
+    private int lastStackFrame = -1;
     private readonly HashSet<string> seenButtonLabels = new();
     private readonly HashSet<string> seenSelectableLabels = new();
 
@@ -69,6 +71,8 @@ public sealed class Plugin : IDalamudPlugin
     // Deferred UI rendering states
     private int lastDrawnGpmFrame = -1;
     private int lastGlamourerWindowFrame = -1;
+    private bool shouldDrawInjectedUI = false;
+    private Guid deferredDesignId = Guid.Empty;
 
     public Plugin()
     {
@@ -130,24 +134,59 @@ public sealed class Plugin : IDalamudPlugin
 
     public void OnBeginWindow(string name)
     {
+        int currentFrame = (int)ImGui.GetFrameCount();
+        if (currentFrame != lastStackFrame)
+        {
+            lastStackFrame = currentFrame;
+            windowStack.Clear();
+        }
+
         if (name != null)
         {
+            windowStack.Push(name);
             currentWindowName = name;
             if (name.Contains("GlamourerMainWindow"))
             {
-                lastGlamourerWindowFrame = (int)ImGui.GetFrameCount();
+                lastGlamourerWindowFrame = currentFrame;
             }
         }
     }
 
     public void OnEndWindow()
     {
-        // No-op, we just track currentWindowName in OnBeginWindow
+        int currentFrame = (int)ImGui.GetFrameCount();
+        if (currentFrame != lastStackFrame)
+        {
+            lastStackFrame = currentFrame;
+            windowStack.Clear();
+            currentWindowName = string.Empty;
+            return;
+        }
+
+        if (windowStack.Count > 0)
+        {
+            windowStack.Pop();
+            currentWindowName = windowStack.Count > 0 ? windowStack.Peek() : string.Empty;
+        }
+        else
+        {
+            currentWindowName = string.Empty;
+        }
     }
 
     private bool IsInGlamourerWindow()
     {
-        return lastGlamourerWindowFrame == (int)ImGui.GetFrameCount() || currentWindowName.Contains("GlamourerMainWindow");
+        return lastGlamourerWindowFrame == (int)ImGui.GetFrameCount() || 
+               currentWindowName.Contains("GlamourerMainWindow") ||
+               windowStack.Any(w => w.Contains("GlamourerMainWindow"));
+    }
+
+    private bool IsTooltipOrPopup()
+    {
+        if (string.IsNullOrEmpty(currentWindowName)) return false;
+        return currentWindowName.IndexOf("Tooltip", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               currentWindowName.IndexOf("Popup", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               currentWindowName.IndexOf("Combo", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private static readonly Regex GuidRegex = new Regex(@"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}", RegexOptions.Compiled);
@@ -358,8 +397,30 @@ public sealed class Plugin : IDalamudPlugin
 
                 if (activeSelectedDesignId != Guid.Empty)
                 {
-                    DrawInjectedUI(activeSelectedDesignId);
+                    shouldDrawInjectedUI = true;
+                    deferredDesignId = activeSelectedDesignId;
                 }
+            }
+        }
+    }
+
+    public void CheckAndDrawDeferredUI()
+    {
+        if (shouldDrawInjectedUI)
+        {
+            if (IsTooltipOrPopup()) return;
+
+            int currentFrame = (int)ImGui.GetFrameCount();
+            if (currentFrame > lastDrawnGpmFrame)
+            {
+                shouldDrawInjectedUI = false;
+                return;
+            }
+
+            shouldDrawInjectedUI = false;
+            if (deferredDesignId != Guid.Empty)
+            {
+                DrawInjectedUI(deferredDesignId);
             }
         }
     }
