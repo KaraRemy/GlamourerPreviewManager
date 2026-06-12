@@ -31,6 +31,10 @@ public class DesignManager : IDisposable
     // Allocation map: UUID -> Image filename (relative to previews folder)
     public Dictionary<Guid, string> Allocations { get; private set; } = new();
 
+    // Fast O(1) lookup maps
+    public Dictionary<Guid, DesignInfo> DesignsById { get; private set; } = new();
+    public Dictionary<string, DesignInfo> DesignsByName { get; private set; } = new(StringComparer.OrdinalIgnoreCase);
+
     public DesignManager(Plugin plugin)
     {
         this.plugin = plugin;
@@ -241,6 +245,7 @@ public class DesignManager : IDisposable
             }
 
             Designs = scannedDesigns.OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase).ToList();
+            RebuildLookupDictionaries();
 
             if (allocationsChanged)
             {
@@ -359,6 +364,7 @@ public class DesignManager : IDisposable
             }
 
             Designs = Designs.OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase).ToList();
+            RebuildLookupDictionaries();
         }
     }
 
@@ -390,6 +396,7 @@ public class DesignManager : IDisposable
                         SaveAllocations();
                     }
                 }
+                RebuildLookupDictionaries();
             }
         }
     }
@@ -565,5 +572,32 @@ public class DesignManager : IDisposable
         var invalidChars = Regex.Escape(new string(Path.GetInvalidFileNameChars()));
         var invalidRegStr = string.Format(@"([{0}]*\.+$)|([{0}]+)", invalidChars);
         return Regex.Replace(name, invalidRegStr, "_");
+    }
+
+    private void RebuildLookupDictionaries()
+    {
+        DesignsById.Clear();
+        DesignsByName.Clear();
+        foreach (var design in Designs)
+        {
+            DesignsById[design.Identifier] = design;
+            DesignsByName[design.Name] = design;
+        }
+    }
+
+    public DesignInfo? GetDesignById(Guid id)
+    {
+        lock (scanLock)
+        {
+            return DesignsById.TryGetValue(id, out var design) ? design : null;
+        }
+    }
+
+    public DesignInfo? GetDesignByName(string name)
+    {
+        lock (scanLock)
+        {
+            return DesignsByName.TryGetValue(name, out var design) ? design : null;
+        }
     }
 }

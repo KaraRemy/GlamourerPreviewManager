@@ -48,8 +48,12 @@ public sealed class Plugin : IDalamudPlugin
     private string currentWindowName = string.Empty;
     private readonly Stack<string> windowStack = new();
     private int lastStackFrame = -1;
+    private bool isInGlamourerWindow = false;
     private readonly HashSet<string> seenButtonLabels = new();
     private readonly HashSet<string> seenSelectableLabels = new();
+
+    // Cache dictionaries for performance optimization
+    private readonly Dictionary<string, (string BustedPath, long LastWriteTicks)> bustedPathCache = new(StringComparer.OrdinalIgnoreCase);
 
     // Reflection fields for Glamourer Selection resolution
     private Assembly? glamourerAssembly;
@@ -76,6 +80,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public Plugin()
     {
+        ClearTempCache();
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
         DesignManager = new DesignManager(this);
@@ -122,6 +127,7 @@ public sealed class Plugin : IDalamudPlugin
 
         CommandManager.RemoveHandler(CommandName);
         CommandManager.RemoveHandler(AltCommandName);
+        ClearTempCache();
     }
 
     private void OnCommand(string command, string args)
@@ -148,6 +154,7 @@ public sealed class Plugin : IDalamudPlugin
             if (name.Contains("GlamourerMainWindow"))
             {
                 lastGlamourerWindowFrame = currentFrame;
+                isInGlamourerWindow = true;
             }
         }
     }
@@ -160,6 +167,7 @@ public sealed class Plugin : IDalamudPlugin
             lastStackFrame = currentFrame;
             windowStack.Clear();
             currentWindowName = string.Empty;
+            isInGlamourerWindow = false;
             return;
         }
 
@@ -172,13 +180,13 @@ public sealed class Plugin : IDalamudPlugin
         {
             currentWindowName = string.Empty;
         }
+
+        isInGlamourerWindow = windowStack.Any(w => w.Contains("GlamourerMainWindow"));
     }
 
     private bool IsInGlamourerWindow()
     {
-        return lastGlamourerWindowFrame == (int)ImGui.GetFrameCount() || 
-               currentWindowName.Contains("GlamourerMainWindow") ||
-               windowStack.Any(w => w.Contains("GlamourerMainWindow"));
+        return isInGlamourerWindow || lastGlamourerWindowFrame == (int)ImGui.GetFrameCount();
     }
 
     private bool IsTooltipOrPopup()
@@ -445,7 +453,7 @@ public sealed class Plugin : IDalamudPlugin
                     cleanName = label.Substring(0, hashIdx);
                 }
 
-                var design = DesignManager.Designs.FirstOrDefault(d => string.Equals(d.Name, cleanName, StringComparison.OrdinalIgnoreCase));
+                var design = DesignManager.GetDesignByName(cleanName);
                 if (design != null)
                 {
                     activeSelectedDesignId = design.Identifier;
@@ -475,7 +483,7 @@ public sealed class Plugin : IDalamudPlugin
                     cleanName = label.Substring(0, hashIdx);
                 }
 
-                var design = DesignManager.Designs.FirstOrDefault(d => string.Equals(d.Name, cleanName, StringComparison.OrdinalIgnoreCase));
+                var design = DesignManager.GetDesignByName(cleanName);
                 if (design != null)
                 {
                     activeSelectedDesignId = design.Identifier;
@@ -510,7 +518,7 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
-        var design = DesignManager.Designs.FirstOrDefault(d => d.Identifier == designId);
+        var design = DesignManager.GetDesignById(designId);
         if (design == null)
         {
             // If the design is not in our list yet, wait or trigger a quick re-scan
@@ -524,7 +532,7 @@ public sealed class Plugin : IDalamudPlugin
         if (design.HasPreview)
         {
             // Load and display preview image
-            var path = design.PreviewImagePath!;
+            var path = GetBustedImagePath(design.PreviewImagePath!);
             
             // Texture loading
             var texture = TextureProvider.GetFromFile(path).GetWrapOrDefault();
@@ -957,5 +965,87 @@ public sealed class Plugin : IDalamudPlugin
     {
         ChatGui.Print("[Glamourer Preview Manager] Welcome! Please configure your Previews Storage Directory in the settings window.");
         ConfigWindow.IsOpen = true;
+    }
+
+    /// <summary>
+    /// Creates a cache-busted copy of the image file in the system temp directory if it has changed,
+    /// resolving caching issues in Dalamud's TextureProvider while keeping directories clean.
+    /// </summary>
+    public string GetBustedImagePath(string path)
+    {
+        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return path;
+
+        try
+        {
+            var lastWrite = File.GetLastWriteTimeUtc(path).Ticks;
+
+            // Return cached busted path immediately if it's already resolved and valid
+            if (bustedPathCache.TryGetValue(path, out var cached) && cached.LastWriteTicks == lastWrite)
+            {
+                return cached.BustedPath;
+            }
+
+            var cacheDir = Path.Combine(Path.GetTempPath(), "GlamourerPreviewManagerCache");
+            if (!Directory.Exists(cacheDir))
+            {
+                Directory.CreateDirectory(cacheDir);
+            }
+
+            var fileDir = Path.GetDirectoryName(path) ?? string.Empty;
+            uint pathHash = 2166136261;
+            foreach (char c in fileDir)
+            {
+                pathHash = (pathHash ^ c) * 16777619;
+            }
+            var pathHashStr = (pathHash & 0xFFFF).ToString("x4");
+
+            var nameWithoutExt = Path.GetFileNameWithoutExtension(path);
+            var ext = Path.GetExtension(path);
+            var cachePath = Path.Combine(cacheDir, $"gpm_{pathHashStr}_{nameWithoutExt}_{lastWrite}{ext}");
+
+            if (!File.Exists(cachePath))
+            {
+                // Clean up previous cache-busted copies for this specific file in the temp directory
+                var searchPattern = $"gpm_{pathHashStr}_{nameWithoutExt}_*{ext}";
+                foreach (var oldFile in Directory.GetFiles(cacheDir, searchPattern))
+                {
+                    try { File.Delete(oldFile); } catch { }
+                }
+
+                // Copy the updated file to the new cache-buster path
+                File.Copy(path, cachePath, true);
+            }
+
+            bustedPathCache[path] = (cachePath, lastWrite);
+            return cachePath;
+        }
+        catch (Exception ex)
+        {
+            Log.Debug($"Failed to create cache-busted image copy in temp: {ex.Message}");
+            return path;
+        }
+    }
+
+    /// <summary>
+    /// Clears all files in the central temporary cache directory to free up disk space.
+    /// </summary>
+    public void ClearTempCache()
+    {
+        try
+        {
+            bustedPathCache.Clear();
+            var cacheDir = Path.Combine(Path.GetTempPath(), "GlamourerPreviewManagerCache");
+            if (Directory.Exists(cacheDir))
+            {
+                foreach (var file in Directory.GetFiles(cacheDir))
+                {
+                    try { File.Delete(file); } catch { }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Debug($"Failed to clear temporary cache: {ex.Message}");
+        }
     }
 }
