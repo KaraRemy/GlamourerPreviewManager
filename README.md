@@ -28,7 +28,7 @@ To install the **Glamourer Preview Manager** using my custom repository:
 1. Launch FINAL FANTASY XIV and open Dalamud Settings using `/xlsettings` in chat.
 2. Navigate to the **Experimental** tab.
 3. Under **Custom Plugin Repositories**, paste the following URL:
-   `https://raw.githubusercontent.com/Tomok2404/TomokPlugins/main/pluginmaster.json`
+   `https://raw.githubusercontent.com/KaraRemy/TomokPlugins/main/pluginmaster.json`
 4. Click the **`+`** button to add the repository, then click **Save and Close**.
 5. Open the Plugin Installer using `/xlplugins` in chat.
 6. Search for **Glamourer Preview Manager** and click **Install**!
@@ -45,7 +45,7 @@ If you need help, want to report a bug, or suggest new features, join my support
 ## FAQ & Troubleshooting
 
 For common questions, performance guidelines, and best practices regarding preview management, check the official FAQ:
-📖 **[Read the FAQ](https://github.com/Tomok2404/TomokPlugins/blob/main/FAQ.md)**
+📖 **[Read the FAQ](https://github.com/KaraRemy/TomokPlugins/blob/main/FAQ.md)**
 
 ---
 
