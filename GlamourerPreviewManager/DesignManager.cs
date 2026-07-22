@@ -56,6 +56,25 @@ public class DesignManager : IDisposable
 
     public string GetDesignsDirectory()
     {
+        try
+        {
+            var configDir = Plugin.PluginInterface.ConfigDirectory.FullName;
+            var parentDir = Path.GetDirectoryName(configDir);
+            if (!string.IsNullOrEmpty(parentDir))
+            {
+                var glamourerDir = Path.Combine(parentDir, "Glamourer", "designs");
+                if (Directory.Exists(glamourerDir))
+                {
+                    return glamourerDir;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Debug($"[GPM] Failed to resolve sibling designs directory: {ex.Message}");
+        }
+
+        // Fallback to default AppData path
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
         return Path.Combine(appData, "XIVLauncher", "pluginConfigs", "Glamourer", "designs");
     }

@@ -85,6 +85,7 @@ public sealed class Plugin : IDalamudPlugin
     private int lastGlamourerWindowFrame = -1;
     private bool shouldDrawInjectedUI = false;
     private Guid deferredDesignId = Guid.Empty;
+    private Guid lastFailedDesignId = Guid.Empty;
 
     public Plugin()
     {
@@ -569,12 +570,23 @@ public sealed class Plugin : IDalamudPlugin
         var design = DesignManager.GetDesignById(designId);
         if (design == null)
         {
-            // If the design is not in our list yet, wait or trigger a quick re-scan
-            ImGui.TextUnformatted("Loading design info...");
+            if (lastFailedDesignId != designId)
+            {
+                lastFailedDesignId = designId;
+                Log.Warning($"[GPM] Selected design {designId} could not be found in designs folder.");
+            }
+
+            ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.4f, 0.4f, 1f));
+            ImGui.TextUnformatted("Design could not be found in designs directory.");
+            ImGui.PopStyleColor();
             ImGui.Spacing();
             ImGui.Separator();
             ImGui.Spacing();
             return;
+        }
+        else
+        {
+            lastFailedDesignId = Guid.Empty;
         }
 
         if (design.HasPreview)
@@ -656,8 +668,92 @@ public sealed class Plugin : IDalamudPlugin
                         
                         DesignManager.Allocations.Remove(designId);
                         DesignManager.SaveAllocations();
-                        design.PreviewImagePath = null;
                     }
+                    design.PreviewImagePath = null;
+                }
+                ImGui.PopStyleColor(2);
+            }
+            else
+            {
+                ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.4f, 0.4f, 1f));
+                ImGui.TextUnformatted("Failed to load preview image (file may be missing or corrupted).");
+                ImGui.PopStyleColor();
+                ImGui.Spacing();
+
+                // Render import options side-by-side or stacked cleanly so they can replace/overwrite it
+                var availWidth = ImGui.GetContentRegionAvail().X;
+                var buttonWidth = (availWidth - ImGui.GetStyle().ItemSpacing.X * 2) / 3f;
+
+                if (ImGui.Button($"Paste Clipboard##GPM_Paste_{designId}", new Vector2(buttonWidth, 30)))
+                {
+                    try
+                    {
+                        using var clipboardImage = ClipboardHelper.GetImageFromClipboard();
+                        if (clipboardImage != null)
+                        {
+                            DesignManager.SaveImageDirect(designId, clipboardImage);
+                            ChatGui.Print("Successfully pasted preview image from clipboard!");
+                        }
+                        else
+                        {
+                            ChatGui.PrintError("No image found in your clipboard!");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error($"Failed to paste clipboard image: {ex}");
+                    }
+                }
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip("Directly paste and crop an image from your clipboard.");
+
+                ImGui.SameLine();
+                if (ImGui.Button($"Browse File##GPM_Browse_{designId}", new Vector2(buttonWidth, 30)))
+                {
+                    FileDialogManager.OpenFileDialog(
+                        "Select Preview Image", 
+                        "Image Files{.png,.jpg,.jpeg,.webp,.bmp,.gif}", 
+                        (success, path) =>
+                        {
+                            if (success)
+                            {
+                                DesignManager.UpdatePreviewImage(designId, path);
+                                ChatGui.Print("Successfully attached preview image!");
+                            }
+                        });
+                }
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip("Browse your local files for a preview image.");
+
+                ImGui.SameLine();
+                if (ImGui.Button($"Screenshot##GPM_Screenshot_{designId}", new Vector2(buttonWidth, 30)))
+                {
+                    if (Configuration.AutoApplyOnScreenshot)
+                    {
+                        CommandManager.ProcessCommand($"/glamour apply {designId} | <me>");
+                    }
+                    SetScreenshotCaptureActive(true);
+                }
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip("Take a cropped screenshot from the center of the screen.");
+
+                ImGui.Spacing();
+
+                // Also provide "Remove Preview Reference" button to clean up
+                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.8f, 0.2f, 0.2f, 0.7f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(1f, 0.3f, 0.3f, 0.9f));
+                if (ImGui.Button($"Remove Preview Reference##GPM_DelImg_{designId}"))
+                {
+                    if (DesignManager.Allocations.TryGetValue(designId, out var imgFile))
+                    {
+                        var imgPath = Path.Combine(previewsFolder, imgFile);
+                        try
+                        {
+                            if (File.Exists(imgPath)) File.Delete(imgPath);
+                        }
+                        catch { }
+                        
+                        DesignManager.Allocations.Remove(designId);
+                        DesignManager.SaveAllocations();
+                    }
+                    design.PreviewImagePath = null;
                 }
                 ImGui.PopStyleColor(2);
             }
