@@ -107,7 +107,7 @@ public sealed class Plugin : IDalamudPlugin
 
         var commandInfo = new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open the Glamourer Preview Manager Config"
+            HelpMessage = "Open the configuration window. Use '/gpm gallery' to open the gallery."
         };
         CommandManager.AddHandler(CommandName, commandInfo);
         CommandManager.AddHandler(AltCommandName, commandInfo);
@@ -175,7 +175,14 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnCommand(string command, string args)
     {
-        ToggleConfigUi();
+        if (!string.IsNullOrWhiteSpace(args) && args.Trim().Equals("gallery", StringComparison.OrdinalIgnoreCase))
+        {
+            ToggleGalleryUi();
+        }
+        else
+        {
+            ToggleConfigUi();
+        }
     }
 
     private void OnGalleryCommand(string command, string args)

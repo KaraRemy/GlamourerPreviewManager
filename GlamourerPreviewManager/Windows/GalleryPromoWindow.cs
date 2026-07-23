@@ -46,7 +46,7 @@ public class GalleryPromoWindow : Window, IDisposable
         ImGui.Spacing();
         ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1.0f), "Key Features:");
         ImGui.BulletText("Apply designs instantly with a quick double-click on any card.");
-        ImGui.BulletText("Launch the Gallery anytime with the command: /gpmgallery");
+        ImGui.BulletText("Launch the Gallery anytime with the command: /gpmgallery or /gpm gallery");
         ImGui.BulletText("Crop & scale options directly configured in GPM settings.");
 
         ImGui.Spacing();
