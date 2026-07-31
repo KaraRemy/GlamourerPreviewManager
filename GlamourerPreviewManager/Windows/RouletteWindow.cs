@@ -156,7 +156,7 @@ public class RouletteWindow : Window, IDisposable
 
         ImGui.Spacing();
         
-        // Center-align Checkbox
+        // Center-align Checkbox 1: Confirm before apply
         var checkboxText = "Confirm before applying outfit";
         var checkboxWidth = ImGui.CalcTextSize(checkboxText).X + ImGui.GetFrameHeight() + ImGui.GetStyle().ItemInnerSpacing.X;
         var cbOffset = (ImGui.GetContentRegionAvail().X - checkboxWidth) / 2f;
@@ -166,6 +166,21 @@ public class RouletteWindow : Window, IDisposable
         if (ImGui.Checkbox($"{checkboxText}##RouletteConfirmInWindow", ref confirm))
         {
             configuration.RouletteConfirmBeforeApply = confirm;
+            configuration.Save();
+        }
+
+        ImGui.Spacing();
+
+        // Center-align Checkbox 2: Include designs without previews
+        var includeNoPreviewText = "Include outfits without a preview image";
+        var includeWidth = ImGui.CalcTextSize(includeNoPreviewText).X + ImGui.GetFrameHeight() + ImGui.GetStyle().ItemInnerSpacing.X;
+        var includeOffset = (ImGui.GetContentRegionAvail().X - includeWidth) / 2f;
+        if (includeOffset > 0) ImGui.SetCursorPosX(ImGui.GetCursorPosX() + includeOffset);
+
+        var includeNoPreview = configuration.RouletteIncludeWithoutPreviews;
+        if (ImGui.Checkbox($"{includeNoPreviewText}##RouletteIncludeNoPreview", ref includeNoPreview))
+        {
+            configuration.RouletteIncludeWithoutPreviews = includeNoPreview;
             configuration.Save();
         }
 
@@ -270,6 +285,13 @@ public class RouletteWindow : Window, IDisposable
                     if (imgOffset > 0) ImGui.SetCursorPosX(ImGui.GetCursorPosX() + imgOffset);
                     ImGui.Image(texture.Handle, new Vector2(width, height));
                 }
+            }
+            else
+            {
+                var noPrevText = "(No preview image attached)";
+                var noPrevWidth = ImGui.CalcTextSize(noPrevText).X;
+                ImGui.SetCursorPosX((ImGui.GetContentRegionAvail().X - noPrevWidth) / 2f + ImGui.GetCursorPosX());
+                ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), noPrevText);
             }
         }
         else if (!string.IsNullOrEmpty(selectionMessage))

@@ -43,6 +43,7 @@ public class Configuration : IPluginConfiguration
 
     // Roulette settings
     public bool RouletteConfirmBeforeApply { get; set; } = true;
+    public bool RouletteIncludeWithoutPreviews { get; set; } = false;
     public List<Guid> RouletteExcludedPool { get; set; } = new();
     public List<string> RouletteExcludedFolders { get; set; } = new();
 

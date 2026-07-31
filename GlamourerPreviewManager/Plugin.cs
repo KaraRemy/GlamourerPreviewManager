@@ -1212,7 +1212,9 @@ public sealed class Plugin : IDalamudPlugin
 
     public List<DesignInfo> GetActiveRoulettePool()
     {
-        var allWithPreview = DesignManager.Designs.Where(d => d.HasPreview).ToList();
+        var allWithPreview = Configuration.RouletteIncludeWithoutPreviews
+            ? DesignManager.Designs.ToList()
+            : DesignManager.Designs.Where(d => d.HasPreview).ToList();
         
         // Filter out by excluded folders
         if (Configuration.RouletteExcludedFolders != null && Configuration.RouletteExcludedFolders.Count > 0)
