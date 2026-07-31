@@ -1,12 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
-    <Version>1.1.1.1</Version>
+    <Version>1.1.2.0</Version>
     <PackageProjectUrl>https://github.com/winstonkoh87/GlamourerPreviewManager</PackageProjectUrl>
     <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
     <IsPackable>false</IsPackable>
     <AssemblyName>GlamourerPreviewManager</AssemblyName>
     <RootNamespace>GlamourerPreviewManager</RootNamespace>
+    <Platforms>x64</Platforms>
+    <Platform>x64</Platform>
   </PropertyGroup>
 
   <ItemGroup>

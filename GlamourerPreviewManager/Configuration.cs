@@ -1,5 +1,6 @@
 using Dalamud.Configuration;
 using System;
+using System.Collections.Generic;
 
 namespace GlamourerPreviewManager;
 
@@ -39,6 +40,11 @@ public class Configuration : IPluginConfiguration
     public string GameScreenshotFolderPath { get; set; } = string.Empty;
     public bool AutoImportFromWatchedFolder { get; set; } = true;
     public bool AutoDeleteWatchedScreenshot { get; set; } = false;
+
+    // Roulette settings
+    public bool RouletteConfirmBeforeApply { get; set; } = true;
+    public List<Guid> RouletteExcludedPool { get; set; } = new();
+    public List<string> RouletteExcludedFolders { get; set; } = new();
 
     // The below exists just to make saving less cumbersome
     public void Save()

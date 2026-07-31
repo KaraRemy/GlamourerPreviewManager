@@ -36,6 +36,11 @@ public class ConfigWindow : Window, IDisposable
     {
         if (ImGui.BeginTabBar("GPM_ConfigTabBar"))
         {
+            if (ImGui.BeginTabItem("Navigation##GPM_NavigationTab"))
+            {
+                DrawNavigationTab();
+                ImGui.EndTabItem();
+            }
             if (ImGui.BeginTabItem("Previews & Storage##GPM_StorageTab"))
             {
                 DrawStorageTab();
@@ -327,6 +332,37 @@ public class ConfigWindow : Window, IDisposable
         {
             Dalamud.Utility.Util.OpenLink("https://ko-fi.com/kararemy");
         }
+        ImGui.Spacing();
+    }
+
+    private void DrawNavigationTab()
+    {
+        ImGui.Spacing();
+        ImGui.TextColored(new Vector4(0.3f, 0.8f, 1f, 1f), "GPM Navigation Hub");
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        ImGui.TextWrapped(
+            "Welcome to Glamourer Preview Manager! Use this navigation hub to quickly open the primary user interface windows."
+        );
+
+        ImGui.Spacing();
+        ImGui.Spacing();
+
+        if (ImGui.Button("Open Preview Gallery##GPM_NavGallery", new Vector2(-1, 40f)))
+        {
+            plugin.ToggleGalleryUi();
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Browse all Glamourer designs in a collapsible category grid and double-click cards to apply them.");
+
+        ImGui.Spacing();
+
+        if (ImGui.Button("Open Outfit Roulette##GPM_NavRoulette", new Vector2(-1, 40f)))
+        {
+            plugin.ToggleRouletteUi();
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Spin the roulette to pick a random design, or enter a number rolled by a friend.");
+        
         ImGui.Spacing();
     }
 }

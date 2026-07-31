@@ -17,6 +17,9 @@ using Dalamud.Interface;
 using Dalamud.Bindings.ImGui;
 using System.Text.RegularExpressions;
 using System.Reflection;
+using Dalamud.Game.Text;
+using Dalamud.Game.Text.SeStringHandling;
+using Dalamud.Game.Chat;
 
 namespace GlamourerPreviewManager;
 
@@ -36,15 +39,23 @@ public sealed class Plugin : IDalamudPlugin
     private const string AltCommandName = "/glampreview";
     private const string GalleryCommandName = "/gpmgallery";
     private const string AltGalleryCommandName = "/glampreviewgallery";
+    private const string RouletteCommandName = "/gpmroulette";
+    private const string AltRouletteCommandName = "/glampreviewroulette";
 
     public Configuration Configuration { get; init; }
     public readonly WindowSystem WindowSystem = new("GlamourerPreviewManager");
     private ConfigWindow ConfigWindow { get; init; }
     private GalleryWindow GalleryWindow { get; init; }
     private GalleryPromoWindow GalleryPromoWindow { get; init; }
+    public RouletteWindow RouletteWindow { get; init; }
     public FileDialogManager FileDialogManager { get; } = new();
     internal ImGuiHookManager ImGuiHookManager { get; }
     public DesignManager DesignManager { get; }
+
+    public int? LastSeenRoll { get; private set; }
+    private static readonly Regex RollRegex = new(
+        @"(?:(?:rolls?|roll|würfelt|würfelst|obtient|obtenez)\s+(?:a\s+|eine\s+)?(?:🎲)?\s*|random!\s*[^\d]*)(\d+)", 
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     // ImGui hook states
     private Guid activeSelectedDesignId = Guid.Empty;
@@ -98,12 +109,14 @@ public sealed class Plugin : IDalamudPlugin
         ConfigWindow = new ConfigWindow(this);
         GalleryWindow = new GalleryWindow(this);
         GalleryPromoWindow = new GalleryPromoWindow(this);
+        RouletteWindow = new RouletteWindow(this);
         ImGuiHookManager = new ImGuiHookManager(this);
         ImGuiHookManager.Initialize();
 
         WindowSystem.AddWindow(ConfigWindow);
         WindowSystem.AddWindow(GalleryWindow);
         WindowSystem.AddWindow(GalleryPromoWindow);
+        WindowSystem.AddWindow(RouletteWindow);
 
         var commandInfo = new CommandInfo(OnCommand)
         {
@@ -118,6 +131,13 @@ public sealed class Plugin : IDalamudPlugin
         };
         CommandManager.AddHandler(GalleryCommandName, galleryCommandInfo);
         CommandManager.AddHandler(AltGalleryCommandName, galleryCommandInfo);
+
+        var rouletteCommandInfo = new CommandInfo(OnRouletteCommand)
+        {
+            HelpMessage = "Open the Glamourer Preview Manager Outfit Roulette"
+        };
+        CommandManager.AddHandler(RouletteCommandName, rouletteCommandInfo);
+        CommandManager.AddHandler(AltRouletteCommandName, rouletteCommandInfo);
 
         PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
         PluginInterface.UiBuilder.Draw += DrawFileDialog;
@@ -144,11 +164,13 @@ public sealed class Plugin : IDalamudPlugin
                 Log.Debug($"Failed to detect default FFXIV screenshot directory: {ex.Message}");
             }
         }
+        ChatGui.ChatMessage += OnChatMessage;
         CheckFirstStartup();
     }
 
     public void Dispose()
     {
+        ChatGui.ChatMessage -= OnChatMessage;
         ClientState.Login -= OnLogin;
 
         PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
@@ -163,11 +185,14 @@ public sealed class Plugin : IDalamudPlugin
         ConfigWindow.Dispose();
         GalleryWindow.Dispose();
         GalleryPromoWindow.Dispose();
+        RouletteWindow.Dispose();
 
         CommandManager.RemoveHandler(CommandName);
         CommandManager.RemoveHandler(AltCommandName);
         CommandManager.RemoveHandler(GalleryCommandName);
         CommandManager.RemoveHandler(AltGalleryCommandName);
+        CommandManager.RemoveHandler(RouletteCommandName);
+        CommandManager.RemoveHandler(AltRouletteCommandName);
         LastRawScreenshot?.Dispose();
         screenshotWatcher?.Dispose();
         ClearTempCache();
@@ -178,6 +203,10 @@ public sealed class Plugin : IDalamudPlugin
         if (!string.IsNullOrWhiteSpace(args) && args.Trim().Equals("gallery", StringComparison.OrdinalIgnoreCase))
         {
             ToggleGalleryUi();
+        }
+        else if (!string.IsNullOrWhiteSpace(args) && args.Trim().Equals("roulette", StringComparison.OrdinalIgnoreCase))
+        {
+            ToggleRouletteUi();
         }
         else
         {
@@ -190,8 +219,14 @@ public sealed class Plugin : IDalamudPlugin
         ToggleGalleryUi();
     }
 
+    private void OnRouletteCommand(string command, string args)
+    {
+        ToggleRouletteUi();
+    }
+
     public void ToggleConfigUi() => ConfigWindow.Toggle();
     public void ToggleGalleryUi() => GalleryWindow.Toggle();
+    public void ToggleRouletteUi() => RouletteWindow.Toggle();
     private void DrawFileDialog() => FileDialogManager.Draw();
 
     public void OnBeginWindow(string name)
@@ -1175,6 +1210,29 @@ public sealed class Plugin : IDalamudPlugin
         ConfigWindow.IsOpen = true;
     }
 
+    public List<DesignInfo> GetActiveRoulettePool()
+    {
+        var allWithPreview = DesignManager.Designs.Where(d => d.HasPreview).ToList();
+        
+        // Filter out by excluded folders
+        if (Configuration.RouletteExcludedFolders != null && Configuration.RouletteExcludedFolders.Count > 0)
+        {
+            allWithPreview = allWithPreview.Where(d => 
+                !Configuration.RouletteExcludedFolders.Contains(d.FileSystemFolder ?? string.Empty)
+            ).ToList();
+        }
+        
+        // Filter out by excluded individual designs
+        if (Configuration.RouletteExcludedPool != null && Configuration.RouletteExcludedPool.Count > 0)
+        {
+            allWithPreview = allWithPreview.Where(d => 
+                !Configuration.RouletteExcludedPool.Contains(d.Identifier)
+            ).ToList();
+        }
+        
+        return allWithPreview;
+    }
+
     /// <summary>
     /// Creates a cache-busted copy of the image file in the system temp directory if it has changed,
     /// resolving caching issues in Dalamud's TextureProvider while keeping directories clean.
@@ -1428,6 +1486,34 @@ public sealed class Plugin : IDalamudPlugin
         {
             Log.Error($"Failed to process auto-imported screenshot: {ex}");
             ChatGui.PrintError("Failed to crop the imported screenshot. See logs for details.");
+        }
+    }
+
+    private void OnChatMessage(IHandleableChatMessage message)
+    {
+        try
+        {
+            var text = message.Message.TextValue;
+            if (string.IsNullOrEmpty(text)) return;
+
+            // Performance pre-filter: quickly discard non-roll messages before running regex
+            if (!text.Contains("roll", StringComparison.OrdinalIgnoreCase) && 
+                !text.Contains("würfel", StringComparison.OrdinalIgnoreCase) && 
+                !text.Contains("obti", StringComparison.OrdinalIgnoreCase) &&
+                !text.Contains("random", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            var match = RollRegex.Match(text);
+            if (match.Success && int.TryParse(match.Groups[1].Value, out var roll))
+            {
+                LastSeenRoll = roll;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Debug($"Failed to parse chat message for roll: {ex.Message}");
         }
     }
 }
