@@ -48,9 +48,12 @@ public sealed class Plugin : IDalamudPlugin
     private GalleryWindow GalleryWindow { get; init; }
     private GalleryPromoWindow GalleryPromoWindow { get; init; }
     public RouletteWindow RouletteWindow { get; init; }
+    public GlamourerPreviewWindow PreviewWindow { get; init; }
     public FileDialogManager FileDialogManager { get; } = new();
     internal ImGuiHookManager ImGuiHookManager { get; }
     public DesignManager DesignManager { get; }
+
+    public Guid ActiveSelectedDesignId => activeSelectedDesignId;
 
     public int? LastSeenRoll { get; private set; }
     private static readonly Regex RollRegex = new(
@@ -110,6 +113,7 @@ public sealed class Plugin : IDalamudPlugin
         GalleryWindow = new GalleryWindow(this);
         GalleryPromoWindow = new GalleryPromoWindow(this);
         RouletteWindow = new RouletteWindow(this);
+        PreviewWindow = new GlamourerPreviewWindow(this);
         ImGuiHookManager = new ImGuiHookManager(this);
         ImGuiHookManager.Initialize();
 
@@ -117,10 +121,11 @@ public sealed class Plugin : IDalamudPlugin
         WindowSystem.AddWindow(GalleryWindow);
         WindowSystem.AddWindow(GalleryPromoWindow);
         WindowSystem.AddWindow(RouletteWindow);
+        WindowSystem.AddWindow(PreviewWindow);
 
         var commandInfo = new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open the configuration window. Use '/gpm gallery' to open the gallery."
+            HelpMessage = "Open the configuration window. Use '/gpm gallery' or '/gpm preview' to open Windows."
         };
         CommandManager.AddHandler(CommandName, commandInfo);
         CommandManager.AddHandler(AltCommandName, commandInfo);
@@ -186,6 +191,7 @@ public sealed class Plugin : IDalamudPlugin
         GalleryWindow.Dispose();
         GalleryPromoWindow.Dispose();
         RouletteWindow.Dispose();
+        PreviewWindow.Dispose();
 
         CommandManager.RemoveHandler(CommandName);
         CommandManager.RemoveHandler(AltCommandName);
@@ -208,6 +214,10 @@ public sealed class Plugin : IDalamudPlugin
         {
             ToggleRouletteUi();
         }
+        else if (!string.IsNullOrWhiteSpace(args) && args.Trim().Equals("preview", StringComparison.OrdinalIgnoreCase))
+        {
+            TogglePreviewUi();
+        }
         else
         {
             ToggleConfigUi();
@@ -227,6 +237,7 @@ public sealed class Plugin : IDalamudPlugin
     public void ToggleConfigUi() => ConfigWindow.Toggle();
     public void ToggleGalleryUi() => GalleryWindow.Toggle();
     public void ToggleRouletteUi() => RouletteWindow.Toggle();
+    public void TogglePreviewUi() => PreviewWindow.Toggle();
     private void DrawFileDialog() => FileDialogManager.Draw();
 
     public void OnBeginWindow(string name)
@@ -384,7 +395,7 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
-    private Guid GetActiveSelectedDesignIdReflection()
+    public Guid GetActiveSelectedDesignIdReflection()
     {
         InitializeReflection();
         if (!reflectionInitialized || serviceManagerInstance == null || designFileSystemType == null) return Guid.Empty;
@@ -398,10 +409,19 @@ public sealed class Plugin : IDalamudPlugin
             }
             else
             {
-                var getServiceMethod = serviceManagerInstance.GetType().GetMethod("GetService", new Type[] { typeof(Type) });
-                if (getServiceMethod != null)
+                var providerProp = serviceManagerInstance.GetType().GetProperty("Provider", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var innerProvider = providerProp?.GetValue(serviceManagerInstance) as IServiceProvider;
+                if (innerProvider != null)
                 {
-                    fileSystem = getServiceMethod.Invoke(serviceManagerInstance, new[] { designFileSystemType });
+                    fileSystem = innerProvider.GetService(designFileSystemType);
+                }
+                else
+                {
+                    var getServiceMethod = serviceManagerInstance.GetType().GetMethod("GetService", new Type[] { typeof(Type) });
+                    if (getServiceMethod != null)
+                    {
+                        fileSystem = getServiceMethod.Invoke(serviceManagerInstance, new[] { designFileSystemType });
+                    }
                 }
             }
 
@@ -478,10 +498,14 @@ public sealed class Plugin : IDalamudPlugin
     {
         if (!IsInGlamourerWindow()) return;
 
-        bool isLastButton = label.Contains("Export to Dat", StringComparison.OrdinalIgnoreCase) || 
-                            label.Contains("Export to Clipboard", StringComparison.OrdinalIgnoreCase);
+        bool isTargetButton = label.Contains("Export to Dat", StringComparison.OrdinalIgnoreCase) || 
+                             label.Contains("Export to Clipboard", StringComparison.OrdinalIgnoreCase) ||
+                             label.Contains("Apply to Yourself", StringComparison.OrdinalIgnoreCase) ||
+                             label.Contains("Apply to yourself", StringComparison.OrdinalIgnoreCase) ||
+                             label.Contains("Apply to Target", StringComparison.OrdinalIgnoreCase) ||
+                             label.Contains("Apply to Self", StringComparison.OrdinalIgnoreCase);
 
-        if (isLastButton)
+        if (isTargetButton)
         {
             int currentFrame = (int)ImGui.GetFrameCount();
             if (lastDrawnGpmFrame != currentFrame)
@@ -584,7 +608,7 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
-    private void DrawInjectedUI(Guid designId)
+    public void DrawInjectedUI(Guid designId)
     {
         ImGui.Spacing();
         ImGui.Separator();

@@ -64,6 +64,22 @@ internal class ImGuiHookManager : IDisposable
         this.plugin = plugin;
     }
 
+    private Hook<T>? CreateHook<T>(IntPtr address, T detour, string name) where T : Delegate
+    {
+        if (address == IntPtr.Zero) return null;
+        try
+        {
+            var hook = Plugin.GameInteropProvider.HookFromAddress<T>(address, detour);
+            hook.Enable();
+            return hook;
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning($"[GPM] Soft warning: Could not create hook for {name}: {ex.Message}");
+            return null;
+        }
+    }
+
     public void Initialize()
     {
         try
@@ -95,78 +111,24 @@ internal class ImGuiHookManager : IDisposable
             var igTreeNodeExStrAddr = GetProcAddress(moduleHandle, "igTreeNodeEx_Str");
             var igTreeNodeExStrStrAddr = GetProcAddress(moduleHandle, "igTreeNodeEx_StrStr");
             var igTreeNodeExPtrAddr = GetProcAddress(moduleHandle, "igTreeNodeEx_Ptr");
-
-            if (igButtonAddr == IntPtr.Zero) Plugin.ChatGui.PrintError("[GPM] Failed to resolve address for igButton.");
-            if (igButtonExAddr == IntPtr.Zero) Plugin.ChatGui.PrintError("[GPM] Failed to resolve address for igButtonEx.");
-            if (igBeginAddr == IntPtr.Zero) Plugin.ChatGui.PrintError("[GPM] Failed to resolve address for igBegin.");
-            if (igEndAddr == IntPtr.Zero) Plugin.ChatGui.PrintError("[GPM] Failed to resolve address for igEnd.");
-            if (igSelectableAddr == IntPtr.Zero) Plugin.ChatGui.PrintError("[GPM] Failed to resolve address for igSelectable_Bool.");
-            if (igSelectablePtrAddr == IntPtr.Zero) Plugin.ChatGui.PrintError("[GPM] Failed to resolve address for igSelectable_BoolPtr.");
-
-            if (igButtonAddr != IntPtr.Zero)
-            {
-                buttonHook = Plugin.GameInteropProvider.HookFromAddress<ButtonDelegate>(igButtonAddr, ButtonDetour);
-                buttonHook.Enable();
-            }
-
-            if (igButtonExAddr != IntPtr.Zero)
-            {
-                buttonExHook = Plugin.GameInteropProvider.HookFromAddress<ButtonExDelegate>(igButtonExAddr, ButtonExDetour);
-                buttonExHook.Enable();
-            }
-
-            if (igBeginAddr != IntPtr.Zero)
-            {
-                beginHook = Plugin.GameInteropProvider.HookFromAddress<BeginDelegate>(igBeginAddr, BeginDetour);
-                beginHook.Enable();
-            }
-
-            if (igEndAddr != IntPtr.Zero)
-            {
-                endHook = Plugin.GameInteropProvider.HookFromAddress<EndDelegate>(igEndAddr, EndDetour);
-                endHook.Enable();
-            }
-
-            if (igSelectableAddr != IntPtr.Zero)
-            {
-                selectableHook = Plugin.GameInteropProvider.HookFromAddress<SelectableDelegate>(igSelectableAddr, SelectableDetour);
-                selectableHook.Enable();
-            }
-
-            if (igSelectablePtrAddr != IntPtr.Zero)
-            {
-                selectablePtrHook = Plugin.GameInteropProvider.HookFromAddress<SelectablePtrDelegate>(igSelectablePtrAddr, SelectablePtrDetour);
-                selectablePtrHook.Enable();
-            }
-
-            if (igTreeNodeExStrAddr != IntPtr.Zero)
-            {
-                treeNodeExStrHook = Plugin.GameInteropProvider.HookFromAddress<TreeNodeExStrDelegate>(igTreeNodeExStrAddr, TreeNodeExStrDetour);
-                treeNodeExStrHook.Enable();
-            }
-
-            if (igTreeNodeExStrStrAddr != IntPtr.Zero)
-            {
-                treeNodeExStrStrHook = Plugin.GameInteropProvider.HookFromAddress<TreeNodeExStrStrDelegate>(igTreeNodeExStrStrAddr, TreeNodeExStrStrDetour);
-                treeNodeExStrStrHook.Enable();
-            }
-
-            if (igTreeNodeExPtrAddr != IntPtr.Zero)
-            {
-                treeNodeExPtrHook = Plugin.GameInteropProvider.HookFromAddress<TreeNodeExPtrDelegate>(igTreeNodeExPtrAddr, TreeNodeExPtrDetour);
-                treeNodeExPtrHook.Enable();
-            }
-
             var igTableNextColumnAddr = GetProcAddress(moduleHandle, "igTableNextColumn");
-            if (igTableNextColumnAddr != IntPtr.Zero)
-            {
-                tableNextColumnHook = Plugin.GameInteropProvider.HookFromAddress<TableNextColumnDelegate>(igTableNextColumnAddr, TableNextColumnDetour);
-                tableNextColumnHook.Enable();
-            }
+
+            buttonHook = CreateHook<ButtonDelegate>(igButtonAddr, ButtonDetour, "igButton");
+            buttonExHook = CreateHook<ButtonExDelegate>(igButtonExAddr, ButtonExDetour, "igButtonEx");
+            beginHook = CreateHook<BeginDelegate>(igBeginAddr, BeginDetour, "igBegin");
+            endHook = CreateHook<EndDelegate>(igEndAddr, EndDetour, "igEnd");
+            tableNextColumnHook = CreateHook<TableNextColumnDelegate>(igTableNextColumnAddr, TableNextColumnDetour, "igTableNextColumn");
+
+            // Secondary hooks (wrapped individually for safety)
+            selectableHook = CreateHook<SelectableDelegate>(igSelectableAddr, SelectableDetour, "igSelectable_Bool");
+            selectablePtrHook = CreateHook<SelectablePtrDelegate>(igSelectablePtrAddr, SelectablePtrDetour, "igSelectable_BoolPtr");
+            treeNodeExStrHook = CreateHook<TreeNodeExStrDelegate>(igTreeNodeExStrAddr, TreeNodeExStrDetour, "igTreeNodeEx_Str");
+            treeNodeExStrStrHook = CreateHook<TreeNodeExStrStrDelegate>(igTreeNodeExStrStrAddr, TreeNodeExStrStrDetour, "igTreeNodeEx_StrStr");
+            treeNodeExPtrHook = CreateHook<TreeNodeExPtrDelegate>(igTreeNodeExPtrAddr, TreeNodeExPtrDetour, "igTreeNodeEx_Ptr");
         }
         catch (Exception ex)
         {
-            Plugin.ChatGui.PrintError($"[GPM] Failed to initialize ImGui native hooks: {ex.Message}");
+            Plugin.Log.Error($"[GPM] Failed to initialize ImGui native hooks: {ex.Message}");
         }
     }
 
