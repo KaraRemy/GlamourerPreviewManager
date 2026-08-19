@@ -81,6 +81,8 @@ public sealed class Plugin : IDalamudPlugin
     private PropertyInfo? selectorSelectionProp;
     private PropertyInfo? leafNodeValueProp;
     private PropertyInfo? designIdentifierProp;
+    private Type? ephemeralConfigType;
+    private PropertyInfo? selectedMainTabProp;
     private bool reflectionInitialized = false;
     private bool reflectionFailed = false;
 
@@ -457,6 +459,10 @@ public sealed class Plugin : IDalamudPlugin
                 {
                     return guid;
                 }
+                if (guidVal != null && Guid.TryParse(guidVal.ToString(), out var parsedGuid))
+                {
+                    return parsedGuid;
+                }
             }
         }
         catch (Exception ex)
@@ -469,13 +475,82 @@ public sealed class Plugin : IDalamudPlugin
         return Guid.Empty;
     }
 
+    public bool IsInDesignsTab()
+    {
+        InitializeReflection();
+        if (!reflectionInitialized || serviceManagerInstance == null) return true;
+
+        try
+        {
+            if (ephemeralConfigType == null && glamourerAssembly != null)
+            {
+                ephemeralConfigType = glamourerAssembly.GetType("Glamourer.Config.EphemeralConfig");
+            }
+
+            if (ephemeralConfigType == null) return true;
+
+            object? ephemeralConfig = null;
+            if (serviceManagerInstance is IServiceProvider provider)
+            {
+                ephemeralConfig = provider.GetService(ephemeralConfigType);
+            }
+            else
+            {
+                var providerProp = serviceManagerInstance.GetType().GetProperty("Provider", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var innerProvider = providerProp?.GetValue(serviceManagerInstance) as IServiceProvider;
+                if (innerProvider != null)
+                {
+                    ephemeralConfig = innerProvider.GetService(ephemeralConfigType);
+                }
+                else
+                {
+                    var getServiceMethod = serviceManagerInstance.GetType().GetMethod("GetService", new Type[] { typeof(Type) });
+                    if (getServiceMethod != null)
+                    {
+                        ephemeralConfig = getServiceMethod.Invoke(serviceManagerInstance, new[] { ephemeralConfigType });
+                    }
+                }
+            }
+
+            if (ephemeralConfig == null) return true;
+
+            if (selectedMainTabProp == null)
+            {
+                selectedMainTabProp = ephemeralConfig.GetType().GetProperty("SelectedMainTab", BindingFlags.Public | BindingFlags.Instance);
+            }
+
+            var tabVal = selectedMainTabProp?.GetValue(ephemeralConfig);
+            if (tabVal != null)
+            {
+                return string.Equals(tabVal.ToString(), "Designs", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        catch { }
+
+        return true;
+    }
+
+    private static bool IsHex(string str)
+    {
+        if (string.IsNullOrEmpty(str)) return false;
+        foreach (char c in str)
+        {
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+                return false;
+        }
+        return true;
+    }
+
     public void OnButtonDraw(string label)
     {
         // Capture design UUID from any buttons containing a GUID, regardless of window filter for safety
         if (TryExtractGuid(label, out var id))
         {
-            activeSelectedDesignId = id;
-            lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+            if (DesignManager.GetDesignById(id) != null)
+            {
+                activeSelectedDesignId = id;
+                lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+            }
         }
 
         // Hook "Apply to Yourself" or "Apply to yourself" to update reflection active design
@@ -483,10 +558,10 @@ public sealed class Plugin : IDalamudPlugin
                              label.Contains("Apply to yourself", StringComparison.OrdinalIgnoreCase) ||
                              label.Contains("Apply to Self", StringComparison.OrdinalIgnoreCase);
 
-        if (isApplyButton)
+        if (isApplyButton && IsInDesignsTab())
         {
             var reflectedGuid = GetActiveSelectedDesignIdReflection();
-            if (reflectedGuid != Guid.Empty)
+            if (reflectedGuid != Guid.Empty && DesignManager.GetDesignById(reflectedGuid) != null)
             {
                 activeSelectedDesignId = reflectedGuid;
                 lastSeenDesignFrame = (int)ImGui.GetFrameCount();
@@ -497,13 +572,12 @@ public sealed class Plugin : IDalamudPlugin
     public void OnButtonDrawAfter(string label)
     {
         if (!IsInGlamourerWindow()) return;
+        if (!IsInDesignsTab()) return;
 
+        // Isolate anchors exclusively to buttons unique to DesignPanel
         bool isTargetButton = label.Contains("Export to Dat", StringComparison.OrdinalIgnoreCase) || 
                              label.Contains("Export to Clipboard", StringComparison.OrdinalIgnoreCase) ||
-                             label.Contains("Apply to Yourself", StringComparison.OrdinalIgnoreCase) ||
-                             label.Contains("Apply to yourself", StringComparison.OrdinalIgnoreCase) ||
-                             label.Contains("Apply to Target", StringComparison.OrdinalIgnoreCase) ||
-                             label.Contains("Apply to Self", StringComparison.OrdinalIgnoreCase);
+                             label.Contains("Apply Mod Associations", StringComparison.OrdinalIgnoreCase);
 
         if (isTargetButton)
         {
@@ -512,13 +586,13 @@ public sealed class Plugin : IDalamudPlugin
             {
                 lastDrawnGpmFrame = currentFrame;
                 var reflectedGuid = GetActiveSelectedDesignIdReflection();
-                if (reflectedGuid != Guid.Empty)
+                if (reflectedGuid != Guid.Empty && DesignManager.GetDesignById(reflectedGuid) != null)
                 {
                     activeSelectedDesignId = reflectedGuid;
                     lastSeenDesignFrame = (int)ImGui.GetFrameCount();
                 }
 
-                if (activeSelectedDesignId != Guid.Empty)
+                if (activeSelectedDesignId != Guid.Empty && DesignManager.GetDesignById(activeSelectedDesignId) != null)
                 {
                     shouldDrawInjectedUI = true;
                     deferredDesignId = activeSelectedDesignId;
@@ -541,7 +615,7 @@ public sealed class Plugin : IDalamudPlugin
             }
 
             shouldDrawInjectedUI = false;
-            if (deferredDesignId != Guid.Empty)
+            if (deferredDesignId != Guid.Empty && DesignManager.GetDesignById(deferredDesignId) != null)
             {
                 DrawInjectedUI(deferredDesignId);
             }
@@ -551,13 +625,17 @@ public sealed class Plugin : IDalamudPlugin
     public void OnSelectableDraw(string label, bool selected)
     {
         if (!IsInGlamourerWindow()) return;
+        if (!IsInDesignsTab()) return;
 
         if (selected)
         {
             if (TryExtractGuid(label, out var id))
             {
-                activeSelectedDesignId = id;
-                lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                if (DesignManager.GetDesignById(id) != null)
+                {
+                    activeSelectedDesignId = id;
+                    lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                }
             }
             else
             {
@@ -567,12 +645,32 @@ public sealed class Plugin : IDalamudPlugin
                 {
                     cleanName = label.Substring(0, hashIdx);
                 }
+                cleanName = cleanName.Trim();
 
                 var design = DesignManager.GetDesignByName(cleanName);
                 if (design != null)
                 {
                     activeSelectedDesignId = design.Identifier;
                     lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                }
+                else if (cleanName.Length == 8 && IsHex(cleanName))
+                {
+                    var matchingDesign = DesignManager.Designs.FirstOrDefault(d => 
+                        d.Identifier.ToString().StartsWith(cleanName, StringComparison.OrdinalIgnoreCase));
+                    if (matchingDesign != null)
+                    {
+                        activeSelectedDesignId = matchingDesign.Identifier;
+                        lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                    }
+                }
+                else
+                {
+                    var reflectedGuid = GetActiveSelectedDesignIdReflection();
+                    if (reflectedGuid != Guid.Empty && DesignManager.GetDesignById(reflectedGuid) != null)
+                    {
+                        activeSelectedDesignId = reflectedGuid;
+                        lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                    }
                 }
             }
         }
@@ -581,13 +679,17 @@ public sealed class Plugin : IDalamudPlugin
     public void OnTreeNodeDraw(string label, bool selected, bool isLeaf)
     {
         if (!IsInGlamourerWindow()) return;
+        if (!IsInDesignsTab()) return;
 
         if (selected && isLeaf)
         {
             if (TryExtractGuid(label, out var id))
             {
-                activeSelectedDesignId = id;
-                lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                if (DesignManager.GetDesignById(id) != null)
+                {
+                    activeSelectedDesignId = id;
+                    lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                }
             }
             else
             {
@@ -597,12 +699,32 @@ public sealed class Plugin : IDalamudPlugin
                 {
                     cleanName = label.Substring(0, hashIdx);
                 }
+                cleanName = cleanName.Trim();
 
                 var design = DesignManager.GetDesignByName(cleanName);
                 if (design != null)
                 {
                     activeSelectedDesignId = design.Identifier;
                     lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                }
+                else if (cleanName.Length == 8 && IsHex(cleanName))
+                {
+                    var matchingDesign = DesignManager.Designs.FirstOrDefault(d => 
+                        d.Identifier.ToString().StartsWith(cleanName, StringComparison.OrdinalIgnoreCase));
+                    if (matchingDesign != null)
+                    {
+                        activeSelectedDesignId = matchingDesign.Identifier;
+                        lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                    }
+                }
+                else
+                {
+                    var reflectedGuid = GetActiveSelectedDesignIdReflection();
+                    if (reflectedGuid != Guid.Empty && DesignManager.GetDesignById(reflectedGuid) != null)
+                    {
+                        activeSelectedDesignId = reflectedGuid;
+                        lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                    }
                 }
             }
         }
@@ -738,6 +860,14 @@ public sealed class Plugin : IDalamudPlugin
                     design.PreviewImagePath = null;
                 }
                 ImGui.PopStyleColor(2);
+            }
+            else if (File.Exists(path))
+            {
+                // File exists on disk and is currently loading asynchronously
+                ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.7f, 0.7f, 0.7f, 1f));
+                ImGui.TextUnformatted("Loading preview image...");
+                ImGui.PopStyleColor();
+                ImGui.Spacing();
             }
             else
             {
