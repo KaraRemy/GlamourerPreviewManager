@@ -703,7 +703,17 @@ public class DesignManager : IDisposable
                 var cleanedName = GetCleanedDesignNameFromFilename(fileNameNoExt);
                 bool hasExplicitTag = Regex.IsMatch(fileNameNoExt, @"[\[\(\{][a-fA-F0-9\-]{8,36}[\]\}\)]");
 
-                if (!hasExplicitTag && safeNameToUnallocatedDesigns.TryGetValue(cleanedName, out var matchingDesigns) && matchingDesigns.Count == 1)
+                List<DesignInfo>? matchingDesigns = null;
+                if (safeNameToUnallocatedDesigns.TryGetValue(fileNameNoExt, out var directMatches) && directMatches.Count == 1)
+                {
+                    matchingDesigns = directMatches;
+                }
+                else if (!hasExplicitTag && safeNameToUnallocatedDesigns.TryGetValue(cleanedName, out var cleanMatches) && cleanMatches.Count == 1)
+                {
+                    matchingDesigns = cleanMatches;
+                }
+
+                if (matchingDesigns != null && matchingDesigns.Count == 1)
                 {
                     var targetDesign = matchingDesigns[0];
                     Allocations[targetDesign.Identifier] = fileNameWithExt;
