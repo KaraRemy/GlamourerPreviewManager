@@ -47,6 +47,9 @@ public class Configuration : IPluginConfiguration
     public List<Guid> RouletteExcludedPool { get; set; } = new();
     public List<string> RouletteExcludedFolders { get; set; } = new();
 
+    // Retention and deletion policies
+    public bool AutoDeletePreviewsOnDesignDeletion { get; set; } = false;
+
     // The below exists just to make saving less cumbersome
     public void Save()
     {

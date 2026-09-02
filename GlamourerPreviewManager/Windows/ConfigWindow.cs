@@ -97,19 +97,51 @@ public class ConfigWindow : Window, IDisposable
         }
 
         ImGui.Spacing();
-        if (ImGui.Button("Rediscover Previews##GPM_Rediscover"))
+        if (ImGui.Button("Rediscover Previews##GPM_Rediscover", new Vector2(200, 30)))
         {
-            var (allocated, total) = plugin.DesignManager.RediscoverPreviews();
-            Plugin.ChatGui.Print($"[Glamourer Preview Manager] {allocated} out of {total} previews were allocated successfully.");
+            var result = plugin.DesignManager.RediscoverPreviews();
+            if (result.HasPendingReviews)
+            {
+                Plugin.ChatGui.Print($"[Glamourer Preview Manager] Allocated {result.AllocatedCount} previews. {result.UnallocatedImages.Count} files require review.");
+                plugin.OpenReviewUi(result);
+            }
+            else
+            {
+                Plugin.ChatGui.Print($"[Glamourer Preview Manager] All {result.AllocatedCount} previews were allocated successfully!");
+            }
         }
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Attempt to map existing image files in the previews storage folder to designs by matching filenames.");
+
+        ImGui.SameLine();
+        if (ImGui.Button("Open Review & Unassigned Images##GPM_OpenReviewBtn", new Vector2(320, 30)))
+        {
+            var result = plugin.DesignManager.RediscoverPreviews();
+            plugin.OpenReviewUi(result);
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Open the interactive review window to inspect ambiguous or unassigned preview image files.");
+
+        ImGui.Spacing();
+        ImGui.TextColored(new Vector4(0.3f, 0.8f, 1f, 1f), "Retention & Deletion Policy");
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        var autoDelPreviews = configuration.AutoDeletePreviewsOnDesignDeletion;
+        if (ImGui.Checkbox("Auto-delete preview images on design deletion##AutoDelPreviews", ref autoDelPreviews))
+        {
+            configuration.AutoDeletePreviewsOnDesignDeletion = autoDelPreviews;
+            configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("When enabled, deleting a design in Glamourer will also permanently delete its preview image file from your previews folder.\nWhen disabled (default), image files remain safely in the folder as unassigned images for you to review or reassign.");
+        }
 
         ImGui.Spacing();
         ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.7f, 0.2f, 1f));
         ImGui.TextWrapped("Important Notice:\n" +
                           "- Please select a dedicated, empty folder to store previews.\n" +
                           "- Do NOT choose a folder inside your Penumbra mod directory, FFXIV game directory, or the synchronizer/Mare sync-ram folders.\n" +
-                          "- Preview images will be named according to design names, and GPM will automatically rename or delete them when designs are updated or removed.");
+                          "- Preview images will be named according to design names, and GPM will safely tag duplicate names with design IDs.");
         ImGui.PopStyleColor();
         ImGui.Spacing();
     }

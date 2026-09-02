@@ -19,6 +19,25 @@ public class DesignInfo
     public bool HasPreview => !string.IsNullOrEmpty(PreviewImagePath);
 }
 
+public class UnallocatedImageEntry
+{
+    public string FilePath { get; set; } = string.Empty;
+    public string FileName { get; set; } = string.Empty;
+    public string CleanedName { get; set; } = string.Empty;
+    public long FileSizeBytes { get; set; }
+    public List<DesignInfo> CandidateDesigns { get; set; } = new();
+    public bool IsAmbiguous => CandidateDesigns.Count > 1;
+}
+
+public class RediscoveryResult
+{
+    public int TotalFilesCount { get; set; }
+    public int AllocatedCount { get; set; }
+    public List<UnallocatedImageEntry> UnallocatedImages { get; set; } = new();
+    public List<DesignInfo> DesignsWithoutPreview { get; set; } = new();
+    public bool HasPendingReviews => UnallocatedImages.Count > 0;
+}
+
 public class DesignManager : IDisposable
 {
     private readonly Plugin plugin;
@@ -34,7 +53,7 @@ public class DesignManager : IDisposable
 
     // Fast O(1) lookup maps
     public Dictionary<Guid, DesignInfo> DesignsById { get; private set; } = new();
-    public Dictionary<string, DesignInfo> DesignsByName { get; private set; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, List<DesignInfo>> DesignsByName { get; private set; } = new(StringComparer.OrdinalIgnoreCase);
 
     public DesignManager(Plugin plugin)
     {
@@ -244,21 +263,19 @@ public class DesignManager : IDisposable
                 scannedDesigns.Add(designInfo);
             }
 
-            // Clean up allocations that belong to designs that no longer exist
+            // Clean up allocations that belong to designs that no longer exist in Glamourer
             var currentIds = scannedDesigns.Select(d => d.Identifier).ToHashSet();
             var keysToRemove = Allocations.Keys.Where(k => !currentIds.Contains(k)).ToList();
             foreach (var key in keysToRemove)
             {
-                // Delete associated image file from previews folder
-                if (!string.IsNullOrEmpty(previewsFolder) && Directory.Exists(previewsFolder))
+                if (plugin.Configuration.AutoDeletePreviewsOnDesignDeletion && Allocations.TryGetValue(key, out var imgFile))
                 {
-                    var imgFile = Allocations[key];
                     var imgPath = Path.Combine(previewsFolder, imgFile);
-                    try
+                    bool isShared = Allocations.Any(kvp => kvp.Key != key && string.Equals(kvp.Value, imgFile, StringComparison.OrdinalIgnoreCase));
+                    if (!isShared && File.Exists(imgPath))
                     {
-                        if (File.Exists(imgPath)) File.Delete(imgPath);
+                        try { File.Delete(imgPath); } catch { }
                     }
-                    catch { }
                 }
                 Allocations.Remove(key);
                 allocationsChanged = true;
@@ -337,22 +354,12 @@ public class DesignManager : IDisposable
                         if (Allocations.TryGetValue(id, out var oldImgFile))
                         {
                             var oldImgPath = Path.Combine(previewsFolder, oldImgFile);
-                            var safeName = GetSafeFilename(designInfo.Name);
-                            var newImgFile = $"{safeName}.png";
+                            var newImgFile = GeneratePreviewFilename(designInfo);
                             var newImgPath = Path.Combine(previewsFolder, newImgFile);
-
-                            // Resolve name conflict if needed
-                            int counter = 1;
-                            while (File.Exists(newImgPath) && newImgPath != oldImgPath)
-                            {
-                                newImgFile = $"{safeName} ({counter}).png";
-                                newImgPath = Path.Combine(previewsFolder, newImgFile);
-                                counter++;
-                            }
 
                             try
                             {
-                                if (File.Exists(oldImgPath))
+                                if (File.Exists(oldImgPath) && oldImgPath != newImgPath)
                                 {
                                     File.Move(oldImgPath, newImgPath);
                                     designInfo.PreviewImagePath = newImgPath;
@@ -374,13 +381,24 @@ public class DesignManager : IDisposable
                     designInfo.PreviewImagePath = existing.PreviewImagePath;
                 }
 
-                // Replace in list
                 var index = Designs.IndexOf(existing);
                 Designs[index] = designInfo;
             }
             else
             {
-                // New design! Add it
+                // New design
+                if (!string.IsNullOrEmpty(previewsFolder) && Directory.Exists(previewsFolder))
+                {
+                    if (Allocations.TryGetValue(id, out var imgFile))
+                    {
+                        var imgPath = Path.Combine(previewsFolder, imgFile);
+                        if (File.Exists(imgPath))
+                        {
+                            designInfo.PreviewImagePath = imgPath;
+                        }
+                    }
+                }
+
                 Designs.Add(designInfo);
             }
 
@@ -400,26 +418,68 @@ public class DesignManager : IDisposable
             if (existing != null)
             {
                 Designs.Remove(existing);
-                
-                var previewsFolder = plugin.Configuration.PreviewsFolderPath;
-                if (!string.IsNullOrEmpty(previewsFolder) && Directory.Exists(previewsFolder))
+
+                // Check if preview image file should be automatically deleted
+                if (plugin.Configuration.AutoDeletePreviewsOnDesignDeletion && Allocations.TryGetValue(id, out var imgFile))
                 {
-                    if (Allocations.TryGetValue(id, out var imgFile))
+                    var previewsFolder = plugin.Configuration.PreviewsFolderPath;
+                    if (!string.IsNullOrEmpty(previewsFolder) && Directory.Exists(previewsFolder))
                     {
                         var imgPath = Path.Combine(previewsFolder, imgFile);
-                        try
+                        bool isShared = Allocations.Any(kvp => kvp.Key != id && string.Equals(kvp.Value, imgFile, StringComparison.OrdinalIgnoreCase));
+                        if (!isShared && File.Exists(imgPath))
                         {
-                            if (File.Exists(imgPath)) File.Delete(imgPath);
+                            try { File.Delete(imgPath); } catch { }
                         }
-                        catch { }
-                        
-                        Allocations.Remove(id);
-                        SaveAllocations();
                     }
                 }
+
+                if (Allocations.ContainsKey(id))
+                {
+                    Allocations.Remove(id);
+                    SaveAllocations();
+                }
+
                 RebuildLookupDictionaries();
             }
         }
+    }
+
+    public string GeneratePreviewFilename(DesignInfo design)
+    {
+        var safeName = GetSafeFilename(design.Name);
+        var shortGuid = design.Identifier.ToString()[..8].ToLowerInvariant();
+        var previewsFolder = plugin.Configuration.PreviewsFolderPath;
+
+        // Check if multiple designs in Glamourer share this exact name
+        bool hasDuplicateName = false;
+        if (DesignsByName.TryGetValue(design.Name, out var list) && list.Count > 1)
+        {
+            hasDuplicateName = true;
+        }
+
+        // If duplicate name, always use deterministic bracketed short GUID tag
+        if (hasDuplicateName)
+        {
+            return $"{safeName} [{shortGuid}].png";
+        }
+
+        // If unique name, check if default filename is already allocated to another design
+        var defaultFilename = $"{safeName}.png";
+        if (Directory.Exists(previewsFolder))
+        {
+            var defaultPath = Path.Combine(previewsFolder, defaultFilename);
+            if (File.Exists(defaultPath))
+            {
+                var allocatedId = Allocations.FirstOrDefault(kvp => string.Equals(kvp.Value, defaultFilename, StringComparison.OrdinalIgnoreCase)).Key;
+                if (allocatedId != Guid.Empty && allocatedId != design.Identifier)
+                {
+                    return $"{safeName} [{shortGuid}].png";
+                }
+            }
+        }
+
+        return defaultFilename;
     }
 
     public void UpdatePreviewImage(Guid id, string sourceImagePath)
@@ -432,24 +492,18 @@ public class DesignManager : IDisposable
             var design = Designs.FirstOrDefault(d => d.Identifier == id);
             if (design == null) return;
 
-            var safeName = GetSafeFilename(design.Name);
-            var destFile = $"{safeName}.png";
+            var destFile = GeneratePreviewFilename(design);
             var destPath = Path.Combine(previewsFolder, destFile);
 
-            // Handle name conflicts
-            int counter = 1;
-            while (File.Exists(destPath))
+            // If there was an old image with a different name, clean it up only if no other design uses it
+            if (Allocations.TryGetValue(id, out var oldFile) && !string.Equals(oldFile, destFile, StringComparison.OrdinalIgnoreCase))
             {
-                destFile = $"{safeName} ({counter}).png";
-                destPath = Path.Combine(previewsFolder, destFile);
-                counter++;
-            }
-
-            // If there was an old image, try to delete it
-            if (Allocations.TryGetValue(id, out var oldFile))
-            {
-                var oldPath = Path.Combine(previewsFolder, oldFile);
-                try { if (File.Exists(oldPath)) File.Delete(oldPath); } catch { }
+                bool isShared = Allocations.Any(kvp => kvp.Key != id && string.Equals(kvp.Value, oldFile, StringComparison.OrdinalIgnoreCase));
+                if (!isShared)
+                {
+                    var oldPath = Path.Combine(previewsFolder, oldFile);
+                    try { if (File.Exists(oldPath)) File.Delete(oldPath); } catch { }
+                }
             }
 
             try
@@ -478,24 +532,18 @@ public class DesignManager : IDisposable
             var design = Designs.FirstOrDefault(d => d.Identifier == id);
             if (design == null) return;
 
-            var safeName = GetSafeFilename(design.Name);
-            var destFile = $"{safeName}.png";
+            var destFile = GeneratePreviewFilename(design);
             var destPath = Path.Combine(previewsFolder, destFile);
 
-            // Handle name conflicts
-            int counter = 1;
-            while (File.Exists(destPath))
+            // If there was an old image with a different name, clean it up only if no other design uses it
+            if (Allocations.TryGetValue(id, out var oldFile) && !string.Equals(oldFile, destFile, StringComparison.OrdinalIgnoreCase))
             {
-                destFile = $"{safeName} ({counter}).png";
-                destPath = Path.Combine(previewsFolder, destFile);
-                counter++;
-            }
-
-            // If there was an old image, try to delete it
-            if (Allocations.TryGetValue(id, out var oldFile))
-            {
-                var oldPath = Path.Combine(previewsFolder, oldFile);
-                try { if (File.Exists(oldPath)) File.Delete(oldPath); } catch { }
+                bool isShared = Allocations.Any(kvp => kvp.Key != id && string.Equals(kvp.Value, oldFile, StringComparison.OrdinalIgnoreCase));
+                if (!isShared)
+                {
+                    var oldPath = Path.Combine(previewsFolder, oldFile);
+                    try { if (File.Exists(oldPath)) File.Delete(oldPath); } catch { }
+                }
             }
 
             try
@@ -519,13 +567,17 @@ public class DesignManager : IDisposable
         ScanDesigns();
     }
 
-    public (int allocatedCount, int totalFilesCount) RediscoverPreviews()
+    public RediscoveryResult RediscoverPreviews()
     {
+        var result = new RediscoveryResult();
         var previewsFolder = plugin.Configuration.PreviewsFolderPath;
         if (string.IsNullOrEmpty(previewsFolder) || !Directory.Exists(previewsFolder))
         {
-            return (0, 0);
+            return result;
         }
+
+        // Rescan Glamourer designs from disk first so in-memory cache is 100% up to date
+        ScanDesigns();
 
         lock (scanLock)
         {
@@ -534,58 +586,235 @@ public class DesignManager : IDisposable
                 ".png", ".jpg", ".jpeg", ".webp", ".bmp"
             };
 
-            var files = Directory.GetFiles(previewsFolder)
+            var allDiskFiles = Directory.GetFiles(previewsFolder)
                 .Where(f => supportedExtensions.Contains(Path.GetExtension(f)))
                 .ToList();
 
-            int totalFiles = files.Count;
-            int allocatedCount = 0;
+            result.TotalFilesCount = allDiskFiles.Count;
 
-            var safeNameToDesign = new Dictionary<string, List<DesignInfo>>(StringComparer.OrdinalIgnoreCase);
-            foreach (var design in Designs)
+            // 1. Identify all files that are ALREADY validly allocated to active existing designs
+            var alreadyAllocatedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kvp in Allocations)
+            {
+                if (DesignsById.ContainsKey(kvp.Key))
+                {
+                    var fullImgPath = Path.Combine(previewsFolder, kvp.Value);
+                    if (File.Exists(fullImgPath))
+                    {
+                        alreadyAllocatedFiles.Add(kvp.Value);
+                    }
+                }
+            }
+
+            result.AllocatedCount = alreadyAllocatedFiles.Count;
+
+            // 2. Identify remaining unallocated disk files
+            var unallocatedDiskFiles = allDiskFiles
+                .Where(f => !alreadyAllocatedFiles.Contains(Path.GetFileName(f)))
+                .ToList();
+
+            // 3. Identify designs that are missing a preview image
+            var unallocatedDesigns = Designs
+                .Where(d => !Allocations.ContainsKey(d.Identifier) || 
+                            !File.Exists(Path.Combine(previewsFolder, Allocations[d.Identifier])))
+                .ToList();
+
+            var safeNameToUnallocatedDesigns = new Dictionary<string, List<DesignInfo>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var design in unallocatedDesigns)
             {
                 var safeName = GetSafeFilename(design.Name);
-                if (!safeNameToDesign.TryGetValue(safeName, out var list))
+                if (!safeNameToUnallocatedDesigns.TryGetValue(safeName, out var list))
                 {
                     list = new List<DesignInfo>();
-                    safeNameToDesign[safeName] = list;
+                    safeNameToUnallocatedDesigns[safeName] = list;
                 }
                 list.Add(design);
             }
 
-            foreach (var file in files)
+            var unallocatedAfterPass1 = new List<string>();
+
+            // PASS 1: Tag / GUID Match on unallocated disk files
+            foreach (var file in unallocatedDiskFiles)
             {
-                var fileNameWithExt = Path.GetFileName(file);
                 var fileNameNoExt = Path.GetFileNameWithoutExtension(file);
+                var fileNameWithExt = Path.GetFileName(file);
+                bool matched = false;
 
-                // Strip copy counter suffix, e.g. " (1)" -> ""
-                var cleanedName = Regex.Replace(fileNameNoExt, @"\s\(\d+\)$", "");
-
-                if (safeNameToDesign.TryGetValue(cleanedName, out var matchingDesigns))
+                // Check for full GUID in filename
+                var fullGuidMatch = Regex.Match(fileNameNoExt, @"([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})");
+                if (fullGuidMatch.Success && Guid.TryParse(fullGuidMatch.Value, out var parsedGuid))
                 {
-                    var targetDesign = matchingDesigns.FirstOrDefault(d => 
-                        !Allocations.ContainsKey(d.Identifier) || 
-                        !File.Exists(Path.Combine(previewsFolder, Allocations[d.Identifier])));
-                    
-                    if (targetDesign == null)
+                    var targetDesign = unallocatedDesigns.FirstOrDefault(d => d.Identifier == parsedGuid);
+                    if (targetDesign != null)
                     {
-                        targetDesign = matchingDesigns.First();
+                        Allocations[targetDesign.Identifier] = fileNameWithExt;
+                        targetDesign.PreviewImagePath = file;
+                        unallocatedDesigns.Remove(targetDesign);
+                        result.AllocatedCount++;
+                        matched = true;
                     }
+                }
 
-                    Allocations[targetDesign.Identifier] = fileNameWithExt;
-                    targetDesign.PreviewImagePath = file;
-                    allocatedCount++;
+                // Check for 8-character bracketed hex tag, e.g. [d8f4e2a1] or (d8f4e2a1) or {d8f4e2a1}
+                if (!matched)
+                {
+                    var tagMatch = Regex.Match(fileNameNoExt, @"[\[\(\{]([a-fA-F0-9]{8})[\]\}\)]");
+                    if (tagMatch.Success)
+                    {
+                        var shortHex = tagMatch.Groups[1].Value;
+                        var targetDesign = unallocatedDesigns.FirstOrDefault(d => 
+                            d.Identifier.ToString().StartsWith(shortHex, StringComparison.OrdinalIgnoreCase));
+                        if (targetDesign != null)
+                        {
+                            Allocations[targetDesign.Identifier] = fileNameWithExt;
+                            targetDesign.PreviewImagePath = file;
+                            unallocatedDesigns.Remove(targetDesign);
+                            result.AllocatedCount++;
+                            matched = true;
+                        }
+                    }
+                }
+
+                if (!matched)
+                {
+                    unallocatedAfterPass1.Add(file);
                 }
             }
 
-            if (allocatedCount > 0)
+            // Rebuild unallocated design name map after Pass 1
+            safeNameToUnallocatedDesigns.Clear();
+            foreach (var design in unallocatedDesigns)
+            {
+                var safeName = GetSafeFilename(design.Name);
+                if (!safeNameToUnallocatedDesigns.TryGetValue(safeName, out var list))
+                {
+                    list = new List<DesignInfo>();
+                    safeNameToUnallocatedDesigns[safeName] = list;
+                }
+                list.Add(design);
+            }
+
+            // PASS 2: Non-ambiguous unique name match on untagged disk files
+            var pass3Files = new List<string>();
+            foreach (var file in unallocatedAfterPass1)
+            {
+                var fileNameWithExt = Path.GetFileName(file);
+                var fileNameNoExt = Path.GetFileNameWithoutExtension(file);
+                var cleanedName = GetCleanedDesignNameFromFilename(fileNameNoExt);
+                bool hasExplicitTag = Regex.IsMatch(fileNameNoExt, @"[\[\(\{][a-fA-F0-9\-]{8,36}[\]\}\)]");
+
+                if (!hasExplicitTag && safeNameToUnallocatedDesigns.TryGetValue(cleanedName, out var matchingDesigns) && matchingDesigns.Count == 1)
+                {
+                    var targetDesign = matchingDesigns[0];
+                    Allocations[targetDesign.Identifier] = fileNameWithExt;
+                    targetDesign.PreviewImagePath = file;
+                    matchingDesigns.Clear();
+                    unallocatedDesigns.Remove(targetDesign);
+                    result.AllocatedCount++;
+                }
+                else
+                {
+                    pass3Files.Add(file);
+                }
+            }
+
+            // PASS 3: Truly Unallocated, Ambiguous, and Orphan Files for Manual Review
+            foreach (var file in pass3Files)
+            {
+                var fileNameWithExt = Path.GetFileName(file);
+                var fileNameNoExt = Path.GetFileNameWithoutExtension(file);
+                var cleanedName = GetCleanedDesignNameFromFilename(fileNameNoExt);
+
+                var entry = new UnallocatedImageEntry
+                {
+                    FilePath = file,
+                    FileName = fileNameWithExt,
+                    CleanedName = cleanedName,
+                    FileSizeBytes = new FileInfo(file).Length
+                };
+
+                if (safeNameToUnallocatedDesigns.TryGetValue(cleanedName, out var matchingDesigns))
+                {
+                    entry.CandidateDesigns = matchingDesigns.ToList();
+                }
+
+                result.UnallocatedImages.Add(entry);
+            }
+
+            // Record designs that still have no preview image
+            result.DesignsWithoutPreview = Designs.Where(d => !d.HasPreview).ToList();
+
+            if (result.AllocatedCount > alreadyAllocatedFiles.Count)
             {
                 SaveAllocations();
                 ScanDesigns();
             }
 
-            return (allocatedCount, totalFiles);
+            return result;
         }
+    }
+
+    public bool AssignUnallocatedImage(string sourceFilePath, Guid targetDesignId)
+    {
+        var previewsFolder = plugin.Configuration.PreviewsFolderPath;
+        if (string.IsNullOrEmpty(previewsFolder) || !Directory.Exists(previewsFolder)) return false;
+
+        lock (scanLock)
+        {
+            var design = Designs.FirstOrDefault(d => d.Identifier == targetDesignId);
+            if (design == null || !File.Exists(sourceFilePath)) return false;
+
+            var targetFileName = GeneratePreviewFilename(design);
+            var targetFilePath = Path.Combine(previewsFolder, targetFileName);
+
+            try
+            {
+                if (!string.Equals(sourceFilePath, targetFilePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (File.Exists(targetFilePath))
+                    {
+                        File.Delete(targetFilePath);
+                    }
+                    File.Move(sourceFilePath, targetFilePath);
+                }
+
+                Allocations[targetDesignId] = targetFileName;
+                design.PreviewImagePath = targetFilePath;
+                SaveAllocations();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.Error($"Failed to assign unallocated image '{sourceFilePath}' to design {design.Name}: {ex.Message}");
+                return false;
+            }
+        }
+    }
+
+    public bool DeleteUnallocatedImage(string filePath)
+    {
+        try
+        {
+            if (File.Exists(filePath))
+            {
+                File.Delete(filePath);
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Error($"Failed to delete unallocated image '{filePath}': {ex.Message}");
+        }
+        return false;
+    }
+
+    public string GetCleanedDesignNameFromFilename(string filenameNoExt)
+    {
+        // Strip bracketed GUID or hex tags e.g. [71599ba7] or (71599ba7) or {71599ba7} or full GUIDs
+        var name = Regex.Replace(filenameNoExt, @"\s*[\[\(\{][a-fA-F0-9\-]{8,36}[\]\}\)]$", "");
+        // Strip copy counters e.g. " (1)"
+        name = Regex.Replace(name, @"\s\(\d+\)$", "");
+        return name.Trim();
     }
 
     private string GetSafeFilename(string name)
@@ -602,7 +831,12 @@ public class DesignManager : IDisposable
         foreach (var design in Designs)
         {
             DesignsById[design.Identifier] = design;
-            DesignsByName[design.Name] = design;
+            if (!DesignsByName.TryGetValue(design.Name, out var list))
+            {
+                list = new List<DesignInfo>();
+                DesignsByName[design.Name] = list;
+            }
+            list.Add(design);
         }
     }
 
@@ -618,7 +852,19 @@ public class DesignManager : IDisposable
     {
         lock (scanLock)
         {
-            return DesignsByName.TryGetValue(name, out var design) ? design : null;
+            if (DesignsByName.TryGetValue(name, out var list) && list.Count > 0)
+            {
+                return list[0];
+            }
+            return null;
+        }
+    }
+
+    public IReadOnlyList<DesignInfo> GetDesignsByName(string name)
+    {
+        lock (scanLock)
+        {
+            return DesignsByName.TryGetValue(name, out var list) ? list : Array.Empty<DesignInfo>();
         }
     }
 }
