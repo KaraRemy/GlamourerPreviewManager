@@ -854,7 +854,49 @@ public class DesignManager : IDisposable
     {
         lock (scanLock)
         {
-            return DesignsById.TryGetValue(id, out var design) ? design : null;
+            if (DesignsById.TryGetValue(id, out var design))
+            {
+                return design;
+            }
+
+            // On-demand fallback: If a design was just saved or unindexed
+            try
+            {
+                var dir = GetDesignsDirectory();
+                var filePath = Path.Combine(dir, $"{id}.json");
+                if (File.Exists(filePath))
+                {
+                    var newDesign = ParseDesignFile(filePath, id);
+                    if (newDesign != null)
+                    {
+                        var previewsFolder = plugin.Configuration.PreviewsFolderPath;
+                        if (!string.IsNullOrEmpty(previewsFolder) && Directory.Exists(previewsFolder) && Allocations.TryGetValue(id, out var imgFile))
+                        {
+                            var imgPath = Path.Combine(previewsFolder, imgFile);
+                            if (File.Exists(imgPath))
+                            {
+                                newDesign.PreviewImagePath = imgPath;
+                            }
+                        }
+
+                        Designs.Add(newDesign);
+                        DesignsById[id] = newDesign;
+                        if (!DesignsByName.TryGetValue(newDesign.Name, out var list))
+                        {
+                            list = new List<DesignInfo>();
+                            DesignsByName[newDesign.Name] = list;
+                        }
+                        list.Add(newDesign);
+                        return newDesign;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.Debug($"[GPM] Failed on-demand design load for {id}: {ex.Message}");
+            }
+
+            return null;
         }
     }
 

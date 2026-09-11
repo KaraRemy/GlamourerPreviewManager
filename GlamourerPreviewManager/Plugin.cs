@@ -79,10 +79,6 @@ public sealed class Plugin : IDalamudPlugin
     private object? serviceManagerInstance;
     private object? cachedDesignFileSystemInstance;
     private MemberInfo? fileSystemSelectionMember;
-    private MemberInfo? singleSelectionMember;
-    private MemberInfo? selectionListMember;
-    private MemberInfo? leafNodeValueMember;
-    private MemberInfo? designIdentifierMember;
     private object? cachedEphemeralConfigInstance;
     private PropertyInfo? selectedMainTabProp;
     private bool reflectionInitialized = false;
@@ -329,11 +325,92 @@ public sealed class Plugin : IDalamudPlugin
         return false;
     }
 
+    private static object? ExtractPropertyValueSafe(object? target, string propertyName)
+    {
+        if (target == null) return null;
+        var type = target.GetType();
+
+        // 1. Direct public property on public class
+        if (type.IsPublic || type.IsNestedPublic)
+        {
+            for (var t = type; t != null && t != typeof(object); t = t.BaseType)
+            {
+                var p = t.GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+                if (p != null && p.GetMethod != null && p.GetMethod.IsPublic)
+                {
+                    try
+                    {
+                        var val = p.GetValue(target);
+                        if (val != null) return val;
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        // 2. Public interfaces (CRITICAL for internal classes like Luna.FileSystemData<T> implementing IFileSystemData)
+        foreach (var iface in type.GetInterfaces())
+        {
+            if (iface.IsPublic || iface.IsNestedPublic)
+            {
+                var p = iface.GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance);
+                if (p != null)
+                {
+                    try
+                    {
+                        var val = p.GetValue(target);
+                        if (val != null) return val;
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        // 3. Any property or field as fallback
+        for (var t = type; t != null && t != typeof(object); t = t.BaseType)
+        {
+            var p = t.GetProperty(propertyName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (p != null)
+            {
+                try
+                {
+                    var val = p.GetValue(target);
+                    if (val != null) return val;
+                }
+                catch { }
+            }
+
+            var f = t.GetField(propertyName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (f != null)
+            {
+                try
+                {
+                    var val = f.GetValue(target);
+                    if (val != null) return val;
+                }
+                catch { }
+            }
+        }
+
+        return null;
+    }
+
     private static object? GetMemberValue(MemberInfo? member, object? target)
     {
         if (member == null || target == null) return null;
-        if (member is PropertyInfo prop) return prop.GetValue(target);
-        if (member is FieldInfo field) return field.GetValue(target);
+        try
+        {
+            if (member is PropertyInfo prop) return prop.GetValue(target);
+            if (member is FieldInfo field) return field.GetValue(target);
+        }
+        catch (Exception)
+        {
+            // If direct member access failed (e.g. MethodAccessException on internal class), try interface fallback
+            if (member is PropertyInfo p)
+            {
+                return ExtractPropertyValueSafe(target, p.Name);
+            }
+        }
         return null;
     }
 
@@ -441,33 +518,101 @@ public sealed class Plugin : IDalamudPlugin
 
             Log.Information($"[GPM] Found Glamourer ServiceManager: {serviceManagerInstance.GetType().FullName}");
 
-            var designFileSystemType = glamourerAssembly.GetType("Glamourer.Designs.DesignFileSystem");
-            if (designFileSystemType == null)
+            // Ensure glamourerAssembly is retrieved directly from the live plugin instance first
+            glamourerAssembly = glamourerInstance.GetType().Assembly;
+            var designFileSystemType = glamourerAssembly.GetType("Glamourer.Designs.DesignFileSystem")
+                                       ?? AppDomain.CurrentDomain.GetAssemblies()
+                                           .FirstOrDefault(a => a.GetName().Name == "Glamourer")?
+                                           .GetType("Glamourer.Designs.DesignFileSystem");
+
+            // Extract Microsoft.Extensions.DependencyInjection.ServiceProvider from Luna.ServiceManager.Provider
+            var providerProp = serviceManagerInstance.GetType().GetProperty("Provider", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            var innerProvider = providerProp?.GetValue(serviceManagerInstance) as IServiceProvider;
+
+            // Multi-Tier Service Resolution for DesignFileSystem:
+            // Tier 1: Invoke generic GetService<T>() on Luna.ServiceManager
+            if (designFileSystemType != null)
             {
-                Log.Warning("[GPM] Could not resolve Glamourer.Designs.DesignFileSystem type from assembly.");
-                return;
+                var getServiceMethod = serviceManagerInstance.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .FirstOrDefault(m => m.Name == "GetService" && m.IsGenericMethodDefinition && m.GetGenericArguments().Length == 1);
+                if (getServiceMethod != null)
+                {
+                    try
+                    {
+                        var genericMethod = getServiceMethod.MakeGenericMethod(designFileSystemType);
+                        cachedDesignFileSystemInstance = genericMethod.Invoke(serviceManagerInstance, null);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Debug($"[GPM] Generic GetService invocation failed: {ex.Message}");
+                    }
+                }
             }
 
-            // Resolve singleton DesignFileSystem instance
-            if (serviceManagerInstance is IServiceProvider provider)
+            // Tier 2: Query Provider as IServiceProvider using designFileSystemType
+            if (cachedDesignFileSystemInstance == null && innerProvider != null && designFileSystemType != null)
             {
-                cachedDesignFileSystemInstance = provider.GetService(designFileSystemType);
-            }
-            else
-            {
-                var providerProp = serviceManagerInstance.GetType().GetProperty("Provider", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                var innerProvider = providerProp?.GetValue(serviceManagerInstance) as IServiceProvider;
-                if (innerProvider != null)
+                try
                 {
                     cachedDesignFileSystemInstance = innerProvider.GetService(designFileSystemType);
                 }
-                else
+                catch { }
+            }
+
+            // Tier 3: Inspect Luna.ServiceManager's _collection (ServiceDescriptor list) to bypass cross-ALC type equality mismatches
+            if (cachedDesignFileSystemInstance == null && innerProvider != null)
+            {
+                var collField = serviceManagerInstance.GetType().GetField("_collection", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (collField?.GetValue(serviceManagerInstance) is System.Collections.IEnumerable coll)
                 {
-                    var getServiceMethod = serviceManagerInstance.GetType().GetMethod("GetService", new Type[] { typeof(Type) });
-                    if (getServiceMethod != null)
+                    foreach (var item in coll)
                     {
-                        cachedDesignFileSystemInstance = getServiceMethod.Invoke(serviceManagerInstance, new[] { designFileSystemType });
+                        if (item == null) continue;
+                        var stProp = item.GetType().GetProperty("ServiceType");
+                        if (stProp?.GetValue(item) is Type st && st.Name == "DesignFileSystem")
+                        {
+                            try
+                            {
+                                cachedDesignFileSystemInstance = innerProvider.GetService(st);
+                                if (cachedDesignFileSystemInstance != null) break;
+                            }
+                            catch { }
+                        }
                     }
+                }
+            }
+
+            // Tier 4: Search ServiceManager._ownedObjects (which stores all instantiated IDisposable services)
+            if (cachedDesignFileSystemInstance == null)
+            {
+                var ownedField = serviceManagerInstance.GetType().GetField("_ownedObjects", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (ownedField?.GetValue(serviceManagerInstance) is System.Collections.IEnumerable owned)
+                {
+                    foreach (var item in owned)
+                    {
+                        if (item != null && item.GetType().Name == "DesignFileSystem")
+                        {
+                            cachedDesignFileSystemInstance = item;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Tier 5: Direct lookup through Glamourer instance fields/properties
+            if (cachedDesignFileSystemInstance == null)
+            {
+                for (var gt = glamourerInstance.GetType(); gt != null && gt != typeof(object); gt = gt.BaseType)
+                {
+                    foreach (var field in gt.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                    {
+                        if (field.FieldType.Name == "DesignFileSystem")
+                        {
+                            cachedDesignFileSystemInstance = field.GetValue(glamourerInstance);
+                            if (cachedDesignFileSystemInstance != null) break;
+                        }
+                    }
+                    if (cachedDesignFileSystemInstance != null) break;
                 }
             }
 
@@ -500,15 +645,24 @@ public sealed class Plugin : IDalamudPlugin
             var ephemType = glamourerAssembly.GetType("Glamourer.Config.EphemeralConfig");
             if (ephemType != null)
             {
-                if (serviceManagerInstance is IServiceProvider p)
+                var getServiceMethod = serviceManagerInstance.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .FirstOrDefault(m => m.Name == "GetService" && m.IsGenericMethodDefinition && m.GetGenericArguments().Length == 1);
+                if (getServiceMethod != null)
                 {
-                    cachedEphemeralConfigInstance = p.GetService(ephemType);
+                    try
+                    {
+                        cachedEphemeralConfigInstance = getServiceMethod.MakeGenericMethod(ephemType).Invoke(serviceManagerInstance, null);
+                    }
+                    catch { }
                 }
-                else
+
+                if (cachedEphemeralConfigInstance == null && innerProvider != null)
                 {
-                    var providerProp = serviceManagerInstance.GetType().GetProperty("Provider", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    var innerP = providerProp?.GetValue(serviceManagerInstance) as IServiceProvider;
-                    cachedEphemeralConfigInstance = innerP?.GetService(ephemType);
+                    try
+                    {
+                        cachedEphemeralConfigInstance = innerProvider.GetService(ephemType);
+                    }
+                    catch { }
                 }
 
                 if (cachedEphemeralConfigInstance != null)
@@ -551,45 +705,18 @@ public sealed class Plugin : IDalamudPlugin
             var selectionObj = GetMemberValue(fileSystemSelectionMember, cachedDesignFileSystemInstance);
             if (selectionObj == null) return Guid.Empty;
 
-            // Lazy bind singleSelectionMember and selectionListMember on demand
-            if (singleSelectionMember == null)
+            // 1. Extract leaf node from selectionObj (Luna.FileSystemSelection)
+            // Property Selection returns IFileSystemData? when a single node is selected
+            object? leafNode = ExtractPropertyValueSafe(selectionObj, "Selection");
+
+            // 2. If single selection was null, check DataNodes / SelectedData / OrderedNodes
+            if (leafNode == null)
             {
-                var selType = selectionObj.GetType();
-                for (var st = selType; st != null && st != typeof(object); st = st.BaseType)
-                {
-                    singleSelectionMember = (MemberInfo?)st.GetProperty("Selection", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                                            ?? st.GetProperty("SingleSelection", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    if (singleSelectionMember != null) break;
-                }
+                var listVal = ExtractPropertyValueSafe(selectionObj, "DataNodes")
+                              ?? ExtractPropertyValueSafe(selectionObj, "SelectedData")
+                              ?? ExtractPropertyValueSafe(selectionObj, "OrderedNodes")
+                              ?? ExtractPropertyValueSafe(selectionObj, "Selection");
 
-                for (var st = selType; st != null && st != typeof(object); st = st.BaseType)
-                {
-                    selectionListMember = (MemberInfo?)st.GetProperty("SelectedData", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                                          ?? (MemberInfo?)st.GetField("SelectedData", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                                          ?? (MemberInfo?)st.GetProperty("DataNodes", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                                          ?? (MemberInfo?)st.GetField("_dataNodes", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                                          ?? (MemberInfo?)st.GetProperty("OrderedSelection", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                                          ?? (MemberInfo?)st.GetProperty("Selection", BindingFlags.Public | BindingFlags.Instance);
-                    if (selectionListMember != null) break;
-                }
-            }
-
-            object? leafNode = null;
-
-            // 1. Try single selection property first
-            if (singleSelectionMember != null)
-            {
-                var val = GetMemberValue(singleSelectionMember, selectionObj);
-                if (val is not System.Collections.IEnumerable)
-                {
-                    leafNode = val;
-                }
-            }
-
-            // 2. If single selection was null or returned a collection, inspect list
-            if (leafNode == null && selectionListMember != null)
-            {
-                var listVal = GetMemberValue(selectionListMember, selectionObj);
                 if (listVal is System.Collections.IList list && list.Count > 0)
                 {
                     leafNode = list[0];
@@ -607,59 +734,36 @@ public sealed class Plugin : IDalamudPlugin
             if (leafNode == null) return Guid.Empty;
 
             // 3. Extract Design object from leaf node (IFileSystemData.Value)
-            object? designObj = leafNode;
-            
-            if (leafNodeValueMember == null)
-            {
-                var t = leafNode.GetType();
-                for (var lt = t; lt != null && lt != typeof(object); lt = lt.BaseType)
-                {
-                    leafNodeValueMember = (MemberInfo?)lt.GetProperty("Value", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                                          ?? (MemberInfo?)lt.GetField("Value", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                                          ?? (MemberInfo?)lt.GetField("_value", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    if (leafNodeValueMember != null) break;
-                }
-                leafNodeValueMember ??= t.GetInterfaces().Select(i => i.GetProperty("Value")).FirstOrDefault(p => p != null);
-            }
-
-            if (leafNodeValueMember != null)
-            {
-                var val = GetMemberValue(leafNodeValueMember, leafNode);
-                if (val != null)
-                {
-                    designObj = val;
-                }
-            }
-
+            // Notice: leafNode is Luna.FileSystemData<Design> (internal sealed class).
+            // ExtractPropertyValueSafe safely dispatches through IFileSystemData.Value (public interface).
+            object? designObj = ExtractPropertyValueSafe(leafNode, "Value") ?? leafNode;
             if (designObj == null) return Guid.Empty;
 
             // 4. Extract Guid identifier
-            if (designIdentifierMember == null)
+            Guid foundGuid = Guid.Empty;
+            var idVal = ExtractPropertyValueSafe(designObj, "Identifier")
+                        ?? ExtractPropertyValueSafe(designObj, "Id")
+                        ?? ExtractPropertyValueSafe(leafNode, "Identifier");
+
+            if (idVal is Guid guid && guid != Guid.Empty)
             {
-                var dt = designObj.GetType();
-                for (var ct = dt; ct != null && ct != typeof(object); ct = ct.BaseType)
-                {
-                    designIdentifierMember = (MemberInfo?)ct.GetProperty("Identifier", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                                             ?? (MemberInfo?)ct.GetProperty("Id", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                                             ?? (MemberInfo?)ct.GetField("Identifier", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                                             ?? (MemberInfo?)ct.GetField("Id", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    if (designIdentifierMember != null) break;
-                }
+                foundGuid = guid;
+            }
+            else if (idVal != null && Guid.TryParse(idVal.ToString(), out var parsedGuid) && parsedGuid != Guid.Empty)
+            {
+                foundGuid = parsedGuid;
             }
 
-            if (designIdentifierMember != null)
+            if (foundGuid != Guid.Empty && DesignManager.GetDesignById(foundGuid) != null)
             {
-                var guidVal = GetMemberValue(designIdentifierMember, designObj);
-                if (guidVal is Guid guid && guid != Guid.Empty)
+                cachedReflectedGuid = foundGuid;
+                if (activeSelectedDesignId != foundGuid)
                 {
-                    cachedReflectedGuid = guid;
-                    return guid;
+                    activeSelectedDesignId = foundGuid;
+                    Log.Debug($"[GPM] Active design changed to {foundGuid} via reflection.");
                 }
-                if (guidVal != null && Guid.TryParse(guidVal.ToString(), out var parsedGuid) && parsedGuid != Guid.Empty)
-                {
-                    cachedReflectedGuid = parsedGuid;
-                    return parsedGuid;
-                }
+                lastSeenDesignFrame = currentFrame;
+                return foundGuid;
             }
         }
         catch (Exception ex)
@@ -683,7 +787,17 @@ public sealed class Plugin : IDalamudPlugin
             var tabVal = selectedMainTabProp.GetValue(cachedEphemeralConfigInstance);
             if (tabVal != null)
             {
-                return string.Equals(tabVal.ToString(), "Designs", StringComparison.OrdinalIgnoreCase);
+                var str = tabVal.ToString();
+                if (string.Equals(str, "Designs", StringComparison.OrdinalIgnoreCase))
+                    return true;
+
+                // Glamourer MainTabType enum: None = 0, Settings = 1, Designs = 2
+                if (tabVal is int intVal && intVal == 2)
+                    return true;
+                if (int.TryParse(str, out var parsedInt) && parsedInt == 2)
+                    return true;
+
+                return false;
             }
         }
         catch { }
