@@ -23,8 +23,20 @@ using Dalamud.Game.Chat;
 
 namespace GlamourerPreviewManager;
 
+public enum ResolutionStage
+{
+    None = 0,
+    ReflectionSelection = 1,
+    ReflectionDataNodes = 2,
+    ButtonGuid = 3,
+    IncognitoHexMatch = 4,
+    NameMatchFallback = 5
+}
+
 public sealed class Plugin : IDalamudPlugin
 {
+    public static Plugin? Instance { get; private set; }
+
     [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
     [PluginService] internal static ITextureProvider TextureProvider { get; private set; } = null!;
     [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
@@ -55,6 +67,9 @@ public sealed class Plugin : IDalamudPlugin
     public DesignManager DesignManager { get; }
 
     public Guid ActiveSelectedDesignId => activeSelectedDesignId;
+    public bool IsReflectionInitialized => reflectionInitialized;
+    public ResolutionStage CurrentResolutionStage => currentResolutionStage;
+    public string CurrentResolutionSource => currentResolutionSource;
 
     public int? LastSeenRoll { get; private set; }
     private static readonly Regex RollRegex = new(
@@ -63,6 +78,8 @@ public sealed class Plugin : IDalamudPlugin
 
     // ImGui hook states
     private Guid activeSelectedDesignId = Guid.Empty;
+    private ResolutionStage currentResolutionStage = ResolutionStage.None;
+    private string currentResolutionSource = "None";
     private int lastSeenDesignFrame = -1;
     private string currentWindowName = string.Empty;
     private readonly Stack<string> windowStack = new();
@@ -76,16 +93,19 @@ public sealed class Plugin : IDalamudPlugin
 
     // High-performance reflection fields for Glamourer Selection resolution
     private Assembly? glamourerAssembly;
+    private object? cachedGlamourerPluginInstance;
     private object? serviceManagerInstance;
     private object? cachedDesignFileSystemInstance;
     private MemberInfo? fileSystemSelectionMember;
     private object? cachedEphemeralConfigInstance;
     private PropertyInfo? selectedMainTabProp;
     private bool reflectionInitialized = false;
-    private int lastReflectionAttemptFrame = -1;
+    private DateTime lastReflectionAttemptTime = DateTime.MinValue;
+    private int reflectionErrorStreak = 0;
 
     // Per-frame memoization for zero frame overhead
     private int lastReflectedFrame = -1;
+    private int reflectedThisFrameCount = 0;
     private Guid cachedReflectedGuid = Guid.Empty;
 
     // Screenshot states
@@ -105,8 +125,60 @@ public sealed class Plugin : IDalamudPlugin
     private Guid deferredDesignId = Guid.Empty;
     private Guid lastFailedDesignId = Guid.Empty;
 
+    #region Centralized Logging Helpers
+    public static void LogVerbose(string message)
+    {
+        if (Instance?.Configuration.LogLevel >= GpmLogLevel.Verbose)
+        {
+            if (Instance?.Configuration.PromoteDebugLogsToInformation == true)
+                Log.Information(message);
+            else
+                Log.Verbose(message);
+        }
+    }
+
+    public static void LogDebug(string message)
+    {
+        if (Instance?.Configuration.LogLevel >= GpmLogLevel.Debug)
+        {
+            if (Instance?.Configuration.PromoteDebugLogsToInformation == true)
+                Log.Information(message);
+            else
+                Log.Debug(message);
+        }
+    }
+
+    public static void LogInfo(string message)
+    {
+        if (Instance?.Configuration.LogLevel >= GpmLogLevel.Information)
+        {
+            Log.Information(message);
+        }
+    }
+
+    public static void LogWarn(string message)
+    {
+        if (Instance?.Configuration.LogLevel >= GpmLogLevel.Warning)
+        {
+            Log.Warning(message);
+        }
+    }
+
+    public static void LogErr(string message, Exception? ex = null)
+    {
+        if (Instance?.Configuration.LogLevel >= GpmLogLevel.Error)
+        {
+            if (ex != null)
+                Log.Error(ex, message);
+            else
+                Log.Error(message);
+        }
+    }
+    #endregion
+
     public Plugin()
     {
+        Instance = this;
         ClearTempCache();
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
@@ -153,6 +225,7 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
         PluginInterface.UiBuilder.Draw += DrawFileDialog;
         PluginInterface.UiBuilder.Draw += DrawScreenshotOverlay;
+        PluginInterface.UiBuilder.Draw += CheckPerFrameLiveness;
         PluginInterface.UiBuilder.OpenConfigUi += ToggleConfigUi;
         PluginInterface.UiBuilder.OpenMainUi += ToggleConfigUi;
         
@@ -181,12 +254,14 @@ public sealed class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
+        if (Instance == this) Instance = null;
         ChatGui.ChatMessage -= OnChatMessage;
         ClientState.Login -= OnLogin;
 
         PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
         PluginInterface.UiBuilder.Draw -= DrawFileDialog;
         PluginInterface.UiBuilder.Draw -= DrawScreenshotOverlay;
+        PluginInterface.UiBuilder.Draw -= CheckPerFrameLiveness;
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleConfigUi;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleConfigUi;
 
@@ -414,29 +489,118 @@ public sealed class Plugin : IDalamudPlugin
         return null;
     }
 
-    private void InitializeReflection()
+    public void InvalidateReflectionCache()
     {
-        if (reflectionInitialized) return;
+        reflectionInitialized = false;
+        glamourerAssembly = null;
+        cachedGlamourerPluginInstance = null;
+        serviceManagerInstance = null;
+        cachedDesignFileSystemInstance = null;
+        fileSystemSelectionMember = null;
+        cachedEphemeralConfigInstance = null;
+        selectedMainTabProp = null;
+        lastReflectedFrame = -1;
+        cachedReflectedGuid = Guid.Empty;
+        reflectedThisFrameCount = 0;
+        reflectionErrorStreak = 0;
+        lastReflectionAttemptTime = DateTime.UtcNow; // Enforce timer cooldown before next reconnect attempt
+    }
 
-        int currentFrame = (int)ImGui.GetFrameCount();
-        // Rate-limit retry attempts to once every 60 frames (1 second) to prevent CPU overhead before Glamourer is ready
-        if (lastReflectionAttemptFrame >= 0 && currentFrame - lastReflectionAttemptFrame < 60) return;
-        lastReflectionAttemptFrame = currentFrame;
+    public void ForceReinitializeReflection()
+    {
+        InvalidateReflectionCache();
+        lastReflectionAttemptTime = DateTime.MinValue; // Bypass timer cooldown for user-initiated manual retry
+        LogInfo("[GPM] Forcing reflection re-initialization...");
+        InitializeReflection();
+        if (reflectionInitialized)
+        {
+            LogInfo("[GPM] Reflection re-initialized successfully!");
+            ChatGui.Print("[GPM] Reflection re-initialized successfully!");
+        }
+        else
+        {
+            LogWarn("[GPM] Reflection re-initialization attempted, but Glamourer was not yet ready.");
+            ChatGui.Print("[GPM] Reflection re-initialization attempted, but Glamourer is not currently ready.");
+        }
+    }
 
+    public void DumpStateToLog()
+    {
+        LogInfo("========== [GPM FULL STATE DIAGNOSTIC DUMP] ==========");
+        LogInfo($"Plugin Version: {GetType().Assembly.GetName().Version}");
+        LogInfo($"Current Frame: {ImGui.GetFrameCount()}");
+        LogInfo($"Active Selected Design ID: {activeSelectedDesignId}");
+        LogInfo($"Resolution Stage: {currentResolutionStage} (Source: {currentResolutionSource})");
+        LogInfo($"In Glamourer Window: {IsInGlamourerWindow()} (Current Window: '{currentWindowName}')");
+        LogInfo($"In Designs Tab: {IsInDesignsTab()}");
+        LogInfo($"Reflection Initialized: {reflectionInitialized}");
+        LogInfo($"Reflection Glamourer Assembly: {glamourerAssembly?.FullName ?? "null"}");
+        LogInfo($"Reflection ServiceManager: {serviceManagerInstance?.GetType().FullName ?? "null"}");
+        LogInfo($"Reflection DesignFileSystem: {cachedDesignFileSystemInstance?.GetType().FullName ?? "null"}");
+        LogInfo($"Reflection SelectionMember: {fileSystemSelectionMember?.Name ?? "null"}");
+        LogInfo($"Reflection EphemeralConfig: {cachedEphemeralConfigInstance?.GetType().FullName ?? "null"}");
+        LogInfo($"Total Indexed Designs: {DesignManager.Designs.Count}");
+        LogInfo($"Total Allocations: {DesignManager.Allocations.Count}");
+        LogInfo($"Config Previews Folder: '{Configuration.PreviewsFolderPath}' (Exists: {Directory.Exists(Configuration.PreviewsFolderPath)})");
+        LogInfo($"Config LogLevel: {Configuration.LogLevel}, PromoteToInfo: {Configuration.PromoteDebugLogsToInformation}");
+        LogInfo("======================================================");
+    }
+
+    public void SetActiveDesignId(Guid newId, ResolutionStage stage, string sourceDetails)
+    {
+        if (newId == Guid.Empty) return;
+
+        bool idChanged = activeSelectedDesignId != newId;
+
+        // Stage hierarchy: Lower integer value = higher authority
+        // Stage 1 (ReflectionSelection) > Stage 2 (ReflectionDataNodes) > Stage 3 (ButtonGuid) > Stage 4 (IncognitoHexMatch) > Stage 5 (NameMatchFallback)
+        // If the design ID has NOT changed, never downgrade a higher authority stage to a lower authority stage
+        if (!idChanged && currentResolutionStage != ResolutionStage.None && (int)stage > (int)currentResolutionStage)
+        {
+            return;
+        }
+
+        bool stageChanged = currentResolutionStage != stage;
+
+        activeSelectedDesignId = newId;
+        currentResolutionStage = stage;
+        currentResolutionSource = sourceDetails;
+        lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+
+        if (idChanged)
+        {
+            if (Configuration.LogSelectionChanges)
+            {
+                var design = DesignManager.GetDesignById(newId);
+                var name = design?.Name ?? "Unknown";
+
+                if (stage == ResolutionStage.NameMatchFallback)
+                {
+                    LogWarn($"[GPM] Active design changed to '{name}' [{newId}] via UNRELIABLE Name Match (Source: {sourceDetails}). Multiple designs may share this name!");
+                }
+                else
+                {
+                    LogInfo($"[GPM] Active design changed to {newId} ('{name}') via {stage} ({sourceDetails}).");
+                }
+            }
+        }
+        else if (stageChanged && Configuration.LogLevel >= GpmLogLevel.Verbose)
+        {
+            LogVerbose($"[GPM] Resolution stage for active design [{newId}] upgraded to {stage} ({sourceDetails}).");
+        }
+    }
+
+    private object? GetLiveGlamourerPluginInstance()
+    {
         try
         {
-            glamourerAssembly ??= AppDomain.CurrentDomain.GetAssemblies()
-                .FirstOrDefault(a => a.GetName().Name == "Glamourer");
-            if (glamourerAssembly == null) return;
-
             var installedPluginsProp = PluginInterface.GetType().GetProperty("InstalledPlugins", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
                                        ?? typeof(IDalamudPluginInterface).GetProperty("InstalledPlugins");
-            if (installedPluginsProp == null) return;
+            if (installedPluginsProp == null) return null;
 
             var installedPlugins = installedPluginsProp.GetValue(PluginInterface) as System.Collections.IEnumerable;
-            if (installedPlugins == null) return;
+            if (installedPlugins == null) return null;
 
-            object? glamourerInstance = null;
             foreach (var plugin in installedPlugins)
             {
                 if (plugin == null) continue;
@@ -451,6 +615,13 @@ public sealed class Plugin : IDalamudPlugin
                 if (string.Equals(name, "Glamourer", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(internalName, "Glamourer", StringComparison.OrdinalIgnoreCase))
                 {
+                    // Check if plugin is loaded / enabled
+                    var isLoadedProp = pt.GetProperty("IsLoaded", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (isLoadedProp != null && isLoadedProp.GetValue(plugin) is bool isLoaded && !isLoaded)
+                    {
+                        return null;
+                    }
+
                     // In Dalamud, InstalledPlugins returns ExposedPlugin which wraps LocalPlugin in '<plugin>P'
                     object targetObj = plugin;
                     var localPluginField = pt.GetField("<plugin>P", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
@@ -472,8 +643,8 @@ public sealed class Plugin : IDalamudPlugin
                                            ?? curType.GetProperty("Plugin", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                         if (instanceProp != null)
                         {
-                            glamourerInstance = instanceProp.GetValue(targetObj);
-                            if (glamourerInstance != null) break;
+                            var inst = instanceProp.GetValue(targetObj);
+                            if (inst != null) return inst;
                         }
 
                         var instanceField = curType.GetField("instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
@@ -482,21 +653,79 @@ public sealed class Plugin : IDalamudPlugin
                                             ?? curType.GetField("_plugin", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                         if (instanceField != null)
                         {
-                            glamourerInstance = instanceField.GetValue(targetObj);
-                            if (glamourerInstance != null) break;
+                            var inst = instanceField.GetValue(targetObj);
+                            if (inst != null) return inst;
                         }
                     }
-                    if (glamourerInstance != null) break;
                 }
             }
+        }
+        catch { }
+        return null;
+    }
 
+    private int lastLivenessCheckFrame = -1;
+
+    public void CheckReflectionLiveness()
+    {
+        int currentFrame = (int)ImGui.GetFrameCount();
+        // Rate-limit liveness check to at most once every 60 frames (~1.0s at 60fps)
+        if (lastLivenessCheckFrame >= 0 && currentFrame - lastLivenessCheckFrame < 60)
+        {
+            return;
+        }
+        lastLivenessCheckFrame = currentFrame;
+
+        var liveInstance = GetLiveGlamourerPluginInstance();
+
+        if (reflectionInitialized)
+        {
+            // If marked initialized, verify the live Glamourer plugin instance hasn't been reloaded, disabled, or replaced
+            if (liveInstance == null || !object.ReferenceEquals(liveInstance, cachedGlamourerPluginInstance))
+            {
+                LogInfo("[GPM] Detected Glamourer plugin reload, disable, or update. Invalidating stale reflection cache...");
+                InvalidateReflectionCache();
+                if (liveInstance != null)
+                {
+                    lastReflectionAttemptTime = DateTime.MinValue; // Immediate reconnect
+                    InitializeReflection();
+                }
+            }
+        }
+        else
+        {
+            // If reflection is currently disconnected, attempt reconnection if Glamourer is now loaded
+            if (liveInstance != null)
+            {
+                InitializeReflection();
+            }
+        }
+    }
+
+    private void CheckPerFrameLiveness() => CheckReflectionLiveness();
+
+    private void InitializeReflection()
+    {
+        if (reflectionInitialized) return;
+
+        // Rate-limit retry attempts to once every 2 seconds to prevent CPU overhead before Glamourer is ready
+        if ((DateTime.UtcNow - lastReflectionAttemptTime).TotalSeconds < 2.0)
+        {
+            return;
+        }
+        lastReflectionAttemptTime = DateTime.UtcNow;
+
+        try
+        {
+            var glamourerInstance = GetLiveGlamourerPluginInstance();
             if (glamourerInstance == null)
             {
-                Log.Warning("[GPM] Could not find Glamourer plugin instance in InstalledPlugins.");
+                if (Configuration.LogLevel >= GpmLogLevel.Verbose)
+                {
+                    LogVerbose("[GPM] Could not find loaded Glamourer plugin instance in InstalledPlugins. Will retry...");
+                }
                 return;
             }
-
-            Log.Information($"[GPM] Found Glamourer instance: {glamourerInstance.GetType().FullName}");
 
             for (var gt = glamourerInstance.GetType(); gt != null && gt != typeof(object); gt = gt.BaseType)
             {
@@ -512,11 +741,9 @@ public sealed class Plugin : IDalamudPlugin
 
             if (serviceManagerInstance == null)
             {
-                Log.Warning("[GPM] Could not find _services field on Glamourer instance.");
+                LogWarn("[GPM] Could not find _services field on Glamourer instance. Will retry...");
                 return;
             }
-
-            Log.Information($"[GPM] Found Glamourer ServiceManager: {serviceManagerInstance.GetType().FullName}");
 
             // Ensure glamourerAssembly is retrieved directly from the live plugin instance first
             glamourerAssembly = glamourerInstance.GetType().Assembly;
@@ -544,7 +771,7 @@ public sealed class Plugin : IDalamudPlugin
                     }
                     catch (Exception ex)
                     {
-                        Log.Debug($"[GPM] Generic GetService invocation failed: {ex.Message}");
+                        LogDebug($"[GPM] Generic GetService invocation failed: {ex.Message}");
                     }
                 }
             }
@@ -618,11 +845,9 @@ public sealed class Plugin : IDalamudPlugin
 
             if (cachedDesignFileSystemInstance == null)
             {
-                Log.Warning("[GPM] Could not resolve DesignFileSystem service from ServiceManager.");
+                LogWarn("[GPM] Could not resolve DesignFileSystem service from ServiceManager. Will retry...");
                 return;
             }
-
-            Log.Information($"[GPM] Resolved DesignFileSystem: {cachedDesignFileSystemInstance.GetType().FullName}");
 
             // BaseFileSystem.Selection can be either a Field or a Property in Luna hierarchy
             var fsType = cachedDesignFileSystemInstance.GetType();
@@ -635,14 +860,12 @@ public sealed class Plugin : IDalamudPlugin
 
             if (fileSystemSelectionMember == null)
             {
-                Log.Warning("[GPM] Could not find Selection member on DesignFileSystem.");
+                LogWarn("[GPM] Could not find Selection member on DesignFileSystem. Will retry...");
                 return;
             }
 
-            Log.Information($"[GPM] Found Selection member: {fileSystemSelectionMember.Name}");
-
             // Also resolve EphemeralConfig for tab state checking
-            var ephemType = glamourerAssembly.GetType("Glamourer.Config.EphemeralConfig");
+            var ephemType = glamourerAssembly?.GetType("Glamourer.Config.EphemeralConfig");
             if (ephemType != null)
             {
                 var getServiceMethod = serviceManagerInstance.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
@@ -672,13 +895,15 @@ public sealed class Plugin : IDalamudPlugin
             }
 
             reflectionInitialized = true;
-            Log.Information("[GPM] Glamourer selection reflection initialized successfully.");
+            cachedGlamourerPluginInstance = glamourerInstance;
+            reflectionErrorStreak = 0;
+            LogInfo("[GPM] Glamourer selection reflection initialized successfully.");
         }
         catch (Exception ex)
         {
             if (ImGui.GetFrameCount() % 3600 == 0)
             {
-                Log.Error($"[GPM] Failed to initialize Glamourer selection reflection: {ex}");
+                LogErr($"[GPM] Failed to initialize Glamourer selection reflection: {ex}");
             }
         }
     }
@@ -686,15 +911,27 @@ public sealed class Plugin : IDalamudPlugin
     public Guid GetActiveSelectedDesignIdReflection()
     {
         int currentFrame = (int)ImGui.GetFrameCount();
-        if (currentFrame == lastReflectedFrame)
+        if (currentFrame != lastReflectedFrame)
+        {
+            lastReflectedFrame = currentFrame;
+            reflectedThisFrameCount = 0;
+            cachedReflectedGuid = Guid.Empty;
+        }
+
+        if (cachedReflectedGuid != Guid.Empty)
         {
             return cachedReflectedGuid;
         }
 
-        lastReflectedFrame = currentFrame;
-        cachedReflectedGuid = Guid.Empty;
+        // Limit reflection queries to at most 2 attempts per frame to avoid CPU overhead on empty/unselected frames
+        if (reflectedThisFrameCount >= 2)
+        {
+            return Guid.Empty;
+        }
+        reflectedThisFrameCount++;
 
-        InitializeReflection();
+        CheckReflectionLiveness();
+
         if (!reflectionInitialized || cachedDesignFileSystemInstance == null || fileSystemSelectionMember == null)
         {
             return Guid.Empty;
@@ -703,7 +940,15 @@ public sealed class Plugin : IDalamudPlugin
         try
         {
             var selectionObj = GetMemberValue(fileSystemSelectionMember, cachedDesignFileSystemInstance);
-            if (selectionObj == null) return Guid.Empty;
+            if (selectionObj == null)
+            {
+                // If selection object is unexpectedly null while inside Glamourer Designs tab, check if Glamourer was reloaded
+                CheckReflectionLiveness();
+                return Guid.Empty;
+            }
+
+            ResolutionStage stage = ResolutionStage.ReflectionSelection;
+            string source = "FileSystemSelection.Selection";
 
             // 1. Extract leaf node from selectionObj (Luna.FileSystemSelection)
             // Property Selection returns IFileSystemData? when a single node is selected
@@ -720,12 +965,16 @@ public sealed class Plugin : IDalamudPlugin
                 if (listVal is System.Collections.IList list && list.Count > 0)
                 {
                     leafNode = list[0];
+                    stage = ResolutionStage.ReflectionDataNodes;
+                    source = "FileSystemSelection.DataNodes[0]";
                 }
                 else if (listVal is System.Collections.IEnumerable enumerable)
                 {
                     foreach (var item in enumerable)
                     {
                         leafNode = item;
+                        stage = ResolutionStage.ReflectionDataNodes;
+                        source = "FileSystemSelection.DataNodes(IEnumerable)";
                         break;
                     }
                 }
@@ -754,23 +1003,43 @@ public sealed class Plugin : IDalamudPlugin
                 foundGuid = parsedGuid;
             }
 
-            if (foundGuid != Guid.Empty && DesignManager.GetDesignById(foundGuid) != null)
+            if (foundGuid != Guid.Empty)
             {
-                cachedReflectedGuid = foundGuid;
-                if (activeSelectedDesignId != foundGuid)
+                // Ensure design exists in GPM (synthesize in-memory if disk index is missing or out of sync)
+                var design = DesignManager.GetDesignById(foundGuid);
+                if (design == null)
                 {
-                    activeSelectedDesignId = foundGuid;
-                    Log.Debug($"[GPM] Active design changed to {foundGuid} via reflection.");
+                    string designName = "Unnamed Design";
+                    try
+                    {
+                        var nameVal = ExtractPropertyValueSafe(designObj, "Name") ?? ExtractPropertyValueSafe(leafNode, "Name");
+                        if (nameVal != null && !string.IsNullOrWhiteSpace(nameVal.ToString()))
+                        {
+                            designName = nameVal.ToString()!;
+                        }
+                    }
+                    catch { }
+
+                    design = DesignManager.RegisterSynthesizedDesign(foundGuid, designName);
                 }
-                lastSeenDesignFrame = currentFrame;
+
+                cachedReflectedGuid = foundGuid;
+                SetActiveDesignId(foundGuid, stage, source);
+                reflectionErrorStreak = 0;
                 return foundGuid;
             }
         }
         catch (Exception ex)
         {
-            if (currentFrame % 3600 == 0)
+            reflectionErrorStreak++;
+            if (reflectionErrorStreak >= 5)
             {
-                Log.Error($"[GPM] Reflection error in GetActiveSelectedDesignIdReflection: {ex}");
+                LogInfo("[GPM] Repeated reflection errors detected (Glamourer may have reloaded or updated). Invalidating reflection cache.");
+                InvalidateReflectionCache();
+            }
+            else if (currentFrame % 1800 == 0)
+            {
+                LogWarn($"[GPM] Reflection error in GetActiveSelectedDesignIdReflection: {ex.Message}");
             }
         }
 
@@ -818,16 +1087,20 @@ public sealed class Plugin : IDalamudPlugin
 
     public void OnButtonDraw(string label)
     {
+        if (string.IsNullOrEmpty(label)) return;
+        if (label.Contains("##GPM_") || label.Contains("###GPM_") || label.StartsWith("GPM_")) return;
+
+        if (Configuration.LogHookEvents && Configuration.LogLevel >= GpmLogLevel.Verbose)
+        {
+            LogVerbose($"[GPM Hook] Button: '{label}'");
+        }
+
         // Capture design UUID from any buttons containing a GUID, regardless of window filter for safety
         if (TryExtractGuid(label, out var id))
         {
             if (DesignManager.GetDesignById(id) != null)
             {
-                if (activeSelectedDesignId != id)
-                {
-                    activeSelectedDesignId = id;
-                }
-                lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                SetActiveDesignId(id, ResolutionStage.ButtonGuid, $"Button Label ({label})");
             }
         }
 
@@ -839,19 +1112,18 @@ public sealed class Plugin : IDalamudPlugin
         if (isApplyButton && IsInDesignsTab())
         {
             var reflectedGuid = GetActiveSelectedDesignIdReflection();
-            if (reflectedGuid != Guid.Empty && DesignManager.GetDesignById(reflectedGuid) != null)
+            if (reflectedGuid != Guid.Empty)
             {
-                if (activeSelectedDesignId != reflectedGuid)
-                {
-                    activeSelectedDesignId = reflectedGuid;
-                }
-                lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                SetActiveDesignId(reflectedGuid, currentResolutionStage, $"ApplyButton Trigger ({label})");
             }
         }
     }
 
     public void OnButtonDrawAfter(string label)
     {
+        if (string.IsNullOrEmpty(label)) return;
+        if (label.Contains("##GPM_") || label.Contains("###GPM_") || label.StartsWith("GPM_")) return;
+
         if (!IsInGlamourerWindow()) return;
         if (!IsInDesignsTab()) return;
 
@@ -867,13 +1139,9 @@ public sealed class Plugin : IDalamudPlugin
                 lastDrawnGpmFrame = currentFrame;
 
                 var reflectedGuid = GetActiveSelectedDesignIdReflection();
-                if (reflectedGuid != Guid.Empty && DesignManager.GetDesignById(reflectedGuid) != null)
+                if (reflectedGuid != Guid.Empty)
                 {
-                    if (activeSelectedDesignId != reflectedGuid)
-                    {
-                        activeSelectedDesignId = reflectedGuid;
-                    }
-                    lastSeenDesignFrame = currentFrame;
+                    SetActiveDesignId(reflectedGuid, currentResolutionStage, $"TargetButton Trigger ({label})");
                 }
 
                 if (activeSelectedDesignId != Guid.Empty && DesignManager.GetDesignById(activeSelectedDesignId) != null)
@@ -908,6 +1176,9 @@ public sealed class Plugin : IDalamudPlugin
 
     public void OnSelectableDraw(string label, bool selected)
     {
+        if (string.IsNullOrEmpty(label)) return;
+        if (label.Contains("##GPM_") || label.Contains("###GPM_")) return;
+
         if (!IsInGlamourerWindow()) return;
         if (!IsInDesignsTab()) return;
 
@@ -915,24 +1186,16 @@ public sealed class Plugin : IDalamudPlugin
         {
             // 1. Primary Authority: Query fast per-frame reflection cache
             var reflectedGuid = GetActiveSelectedDesignIdReflection();
-            if (reflectedGuid != Guid.Empty && DesignManager.GetDesignById(reflectedGuid) != null)
+            if (reflectedGuid != Guid.Empty)
             {
-                if (activeSelectedDesignId != reflectedGuid)
-                {
-                    activeSelectedDesignId = reflectedGuid;
-                }
-                lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                SetActiveDesignId(reflectedGuid, currentResolutionStage, $"Selectable Refl ({label})");
                 return;
             }
 
             // 2. Fallback: Try extracting GUID directly from label
             if (TryExtractGuid(label, out var id) && DesignManager.GetDesignById(id) != null)
             {
-                if (activeSelectedDesignId != id)
-                {
-                    activeSelectedDesignId = id;
-                }
-                lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                SetActiveDesignId(id, ResolutionStage.ButtonGuid, $"Selectable GUID ({label})");
                 return;
             }
 
@@ -958,11 +1221,7 @@ public sealed class Plugin : IDalamudPlugin
                     d.Identifier.ToString().StartsWith(cleanName, StringComparison.OrdinalIgnoreCase));
                 if (matchingDesign != null)
                 {
-                    if (activeSelectedDesignId != matchingDesign.Identifier)
-                    {
-                        activeSelectedDesignId = matchingDesign.Identifier;
-                    }
-                    lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                    SetActiveDesignId(matchingDesign.Identifier, ResolutionStage.IncognitoHexMatch, $"Selectable Incognito Hex ({cleanName})");
                     return;
                 }
             }
@@ -977,25 +1236,21 @@ public sealed class Plugin : IDalamudPlugin
 
             if (matchingList.Count == 1)
             {
-                if (activeSelectedDesignId != matchingList[0].Identifier)
-                {
-                    activeSelectedDesignId = matchingList[0].Identifier;
-                }
-                lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                SetActiveDesignId(matchingList[0].Identifier, ResolutionStage.NameMatchFallback, $"Selectable Unique Name ('{cleanName}')");
             }
             else if (matchingList.Count > 1)
             {
-                if (!matchingList.Any(d => d.Identifier == activeSelectedDesignId))
-                {
-                    activeSelectedDesignId = matchingList[0].Identifier;
-                }
-                lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                var targetDesign = matchingList.FirstOrDefault(d => d.Identifier == activeSelectedDesignId) ?? matchingList[0];
+                SetActiveDesignId(targetDesign.Identifier, ResolutionStage.NameMatchFallback, $"Selectable Multiple Names ('{cleanName}', {matchingList.Count} matches)");
             }
         }
     }
 
     public void OnTreeNodeDraw(string label, bool selected, bool isLeaf)
     {
+        if (string.IsNullOrEmpty(label)) return;
+        if (label.Contains("##GPM_") || label.Contains("###GPM_")) return;
+
         if (!IsInGlamourerWindow()) return;
         if (!IsInDesignsTab()) return;
 
@@ -1003,24 +1258,16 @@ public sealed class Plugin : IDalamudPlugin
         {
             // 1. Primary Authority: Query fast per-frame reflection cache
             var reflectedGuid = GetActiveSelectedDesignIdReflection();
-            if (reflectedGuid != Guid.Empty && DesignManager.GetDesignById(reflectedGuid) != null)
+            if (reflectedGuid != Guid.Empty)
             {
-                if (activeSelectedDesignId != reflectedGuid)
-                {
-                    activeSelectedDesignId = reflectedGuid;
-                }
-                lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                SetActiveDesignId(reflectedGuid, currentResolutionStage, $"TreeNode Refl ({label})");
                 return;
             }
 
             // 2. Fallback: Try extracting GUID directly from label
             if (TryExtractGuid(label, out var id) && DesignManager.GetDesignById(id) != null)
             {
-                if (activeSelectedDesignId != id)
-                {
-                    activeSelectedDesignId = id;
-                }
-                lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                SetActiveDesignId(id, ResolutionStage.ButtonGuid, $"TreeNode GUID ({label})");
                 return;
             }
 
@@ -1046,11 +1293,7 @@ public sealed class Plugin : IDalamudPlugin
                     d.Identifier.ToString().StartsWith(cleanName, StringComparison.OrdinalIgnoreCase));
                 if (matchingDesign != null)
                 {
-                    if (activeSelectedDesignId != matchingDesign.Identifier)
-                    {
-                        activeSelectedDesignId = matchingDesign.Identifier;
-                    }
-                    lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                    SetActiveDesignId(matchingDesign.Identifier, ResolutionStage.IncognitoHexMatch, $"TreeNode Incognito Hex ({cleanName})");
                     return;
                 }
             }
@@ -1065,19 +1308,12 @@ public sealed class Plugin : IDalamudPlugin
 
             if (matchingList.Count == 1)
             {
-                if (activeSelectedDesignId != matchingList[0].Identifier)
-                {
-                    activeSelectedDesignId = matchingList[0].Identifier;
-                }
-                lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                SetActiveDesignId(matchingList[0].Identifier, ResolutionStage.NameMatchFallback, $"TreeNode Unique Name ('{cleanName}')");
             }
             else if (matchingList.Count > 1)
             {
-                if (!matchingList.Any(d => d.Identifier == activeSelectedDesignId))
-                {
-                    activeSelectedDesignId = matchingList[0].Identifier;
-                }
-                lastSeenDesignFrame = (int)ImGui.GetFrameCount();
+                var targetDesign = matchingList.FirstOrDefault(d => d.Identifier == activeSelectedDesignId) ?? matchingList[0];
+                SetActiveDesignId(targetDesign.Identifier, ResolutionStage.NameMatchFallback, $"TreeNode Multiple Names ('{cleanName}', {matchingList.Count} matches)");
             }
         }
     }
@@ -1369,9 +1605,91 @@ public sealed class Plugin : IDalamudPlugin
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("Take a cropped screenshot from the center of the screen.");
         }
 
+        // Live diagnostic overlay below preview controls (visible if enabled or log level >= Debug)
+        DrawDebugOverlay(design);
+
         ImGui.Spacing();
         ImGui.Separator();
         ImGui.Spacing();
+    }
+
+    private void DrawDebugOverlay(DesignInfo design)
+    {
+        if (!Configuration.ShowDebugOverlayBelowPreview && Configuration.LogLevel < GpmLogLevel.Debug)
+            return;
+
+        ImGui.Spacing();
+        ImGui.PushStyleColor(ImGuiCol.Border, new Vector4(0.3f, 0.5f, 0.8f, 0.5f));
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameBorderSize, 1f);
+        ImGui.PushStyleVar(ImGuiStyleVar.ChildRounding, 4f);
+
+        float boxHeight = 44f * ImGuiHelpers.GlobalScale;
+        if (ImGui.BeginChild("##GPM_DebugOverlay", new Vector2(0, boxHeight), true, ImGuiWindowFlags.NoScrollbar))
+        {
+            Vector4 stageColor = currentResolutionStage switch
+            {
+                ResolutionStage.ReflectionSelection => new Vector4(0.4f, 0.9f, 0.4f, 1f), // Green
+                ResolutionStage.ReflectionDataNodes => new Vector4(0.6f, 0.9f, 0.4f, 1f), // Light green
+                ResolutionStage.ButtonGuid => new Vector4(0.4f, 0.8f, 1f, 1f),          // Cyan
+                ResolutionStage.IncognitoHexMatch => new Vector4(0.9f, 0.8f, 0.3f, 1f),    // Yellow
+                ResolutionStage.NameMatchFallback => new Vector4(1f, 0.4f, 0.3f, 1f),    // Red/Orange warning
+                _ => new Vector4(0.7f, 0.7f, 0.7f, 1f)
+            };
+
+            ImGui.TextColored(new Vector4(0.6f, 0.8f, 1f, 1f), "[GPM DEBUG]");
+            ImGui.SameLine();
+            ImGui.TextUnformatted("Design:");
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(1f, 1f, 1f, 1f), $"\"{design.Name}\"");
+            ImGui.SameLine();
+            var guidShort = design.Identifier.ToString();
+            if (guidShort.Length >= 8) guidShort = guidShort.Substring(0, 8);
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), $"[{guidShort}]");
+
+            ImGui.TextUnformatted("Stage:");
+            ImGui.SameLine();
+            ImGui.TextColored(stageColor, $"{currentResolutionStage}");
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), $"({currentResolutionSource})");
+
+            ImGui.SameLine();
+            ImGui.TextUnformatted("| Refl:");
+            ImGui.SameLine();
+            if (reflectionInitialized)
+            {
+                ImGui.TextColored(new Vector4(0.3f, 0.9f, 0.3f, 1f), "Connected");
+            }
+            else
+            {
+                ImGui.TextColored(new Vector4(1f, 0.3f, 0.3f, 1f), "Disconnected");
+            }
+
+            if (ImGui.IsWindowHovered())
+            {
+                ImGui.BeginTooltip();
+                ImGui.TextUnformatted($"Active Design GUID: {design.Identifier}");
+                ImGui.TextUnformatted($"Design File System Folder: {(string.IsNullOrEmpty(design.FileSystemFolder) ? "(root)" : design.FileSystemFolder)}");
+                ImGui.TextUnformatted($"Resolution Pipeline: Stage {(int)currentResolutionStage} / 5 ({currentResolutionStage})");
+                ImGui.TextUnformatted($"Source Detail: {currentResolutionSource}");
+                ImGui.TextUnformatted($"Reflection Status: {(reflectionInitialized ? "Active & Bound" : "Unbound / Retrying")}");
+                ImGui.TextUnformatted($"Has Preview Image: {(design.HasPreview ? "Yes" : "No")}");
+                if (design.HasPreview)
+                {
+                    ImGui.TextUnformatted($"Image Path: {design.PreviewImagePath}");
+                }
+                ImGui.TextUnformatted($"Total Designs In Memory: {DesignManager.Designs.Count}");
+                if (currentResolutionStage == ResolutionStage.NameMatchFallback)
+                {
+                    ImGui.Spacing();
+                    ImGui.TextColored(new Vector4(1f, 0.3f, 0.3f, 1f), "WARNING: Currently resolving by name match fallback!");
+                    ImGui.TextColored(new Vector4(1f, 0.7f, 0.3f, 1f), "If multiple designs share this name, previews may become inaccurate.");
+                }
+                ImGui.EndTooltip();
+            }
+        }
+        ImGui.EndChild();
+        ImGui.PopStyleVar(2);
+        ImGui.PopStyleColor();
     }
 
     private void DrawScreenshotOverlay()

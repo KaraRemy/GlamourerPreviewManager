@@ -56,6 +56,11 @@ public class ConfigWindow : Window, IDisposable
                 DrawScreenshotTab();
                 ImGui.EndTabItem();
             }
+            if (ImGui.BeginTabItem("Debug & Logging##GPM_DebugTab"))
+            {
+                DrawDebugTab();
+                ImGui.EndTabItem();
+            }
             if (ImGui.BeginTabItem("Information##GPM_InfoTab"))
             {
                 DrawInfoTab();
@@ -395,6 +400,120 @@ public class ConfigWindow : Window, IDisposable
         }
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Spin the roulette to pick a random design, or enter a number rolled by a friend.");
         
+        ImGui.Spacing();
+    }
+
+    private void DrawDebugTab()
+    {
+        ImGui.Spacing();
+        ImGui.TextColored(new Vector4(0.3f, 0.8f, 1f, 1f), "Debugging, Reflection & Diagnostics");
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        ImGui.TextWrapped(
+            "Configure logging verbosity, inspect active selection state, and troubleshoot connection to Glamourer."
+        );
+        ImGui.Spacing();
+
+        // 1. Log Level selector
+        ImGui.TextUnformatted("Plugin Log Level (/xllog):");
+        var currentLogLevel = configuration.LogLevel;
+        var logLevelNames = Enum.GetNames<GpmLogLevel>();
+        int selectedIndex = (int)currentLogLevel;
+
+        ImGui.SetNextItemWidth(200f);
+        if (ImGui.Combo("##GPM_LogLevelCombo", ref selectedIndex, logLevelNames, logLevelNames.Length))
+        {
+            configuration.LogLevel = (GpmLogLevel)selectedIndex;
+            configuration.Save();
+            Plugin.LogInfo($"[GPM] Log level set to {configuration.LogLevel}");
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Controls the minimum severity of messages sent to Dalamud's /xllog window.");
+
+        ImGui.Spacing();
+
+        // Promote Debug to Info toggle
+        var promoteInfo = configuration.PromoteDebugLogsToInformation;
+        if (ImGui.Checkbox("Promote Debug logs to Information level##GPM_PromoteLogs", ref promoteInfo))
+        {
+            configuration.PromoteDebugLogsToInformation = promoteInfo;
+            configuration.Save();
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Dalamud's /xllog filters out Debug logs by default unless global Debug mode is on in Dalamud settings. Checking this forwards GPM Debug messages as Information so you can easily see them in /xllog without changing global Dalamud settings.");
+
+        // Show Debug Overlay toggle
+        var showOverlay = configuration.ShowDebugOverlayBelowPreview;
+        if (ImGui.Checkbox("Show live diagnostic overlay below preview in Glamourer##GPM_ShowOverlay", ref showOverlay))
+        {
+            configuration.ShowDebugOverlayBelowPreview = showOverlay;
+            configuration.Save();
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Displays a diagnostic bar directly beneath preview images in Glamourer showing the currently resolved design, resolution stage, and reflection health.");
+
+        // Log selection changes toggle
+        var logSelection = configuration.LogSelectionChanges;
+        if (ImGui.Checkbox("Log active design selection changes to /xllog##GPM_LogSelection", ref logSelection))
+        {
+            configuration.LogSelectionChanges = logSelection;
+            configuration.Save();
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        // 2. Live Diagnostics readout
+        ImGui.TextColored(new Vector4(0.9f, 0.7f, 0.2f, 1f), "Current Reflection & Selection Status:");
+        ImGui.Spacing();
+
+        ImGui.BulletText($"Reflection Initialized: {(plugin.IsReflectionInitialized ? "Connected" : "Disconnected / Retrying")}");
+        ImGui.BulletText($"Current Resolution Stage: {plugin.CurrentResolutionStage}");
+        ImGui.BulletText($"Last Resolution Source: {plugin.CurrentResolutionSource}");
+        ImGui.BulletText($"Active Selected Design ID: {(plugin.ActiveSelectedDesignId == Guid.Empty ? "None" : plugin.ActiveSelectedDesignId.ToString())}");
+        var activeDesign = plugin.DesignManager.GetDesignById(plugin.ActiveSelectedDesignId);
+        ImGui.BulletText($"Active Design Name: {(activeDesign != null ? $"\"{activeDesign.Name}\"" : "(Not found)")}");
+        ImGui.BulletText($"Total Indexed Designs: {plugin.DesignManager.Designs.Count}");
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        // 3. Actions / Troubleshooting Buttons
+        ImGui.TextColored(new Vector4(0.3f, 0.8f, 1f, 1f), "Troubleshooting Actions");
+        ImGui.Spacing();
+
+        if (ImGui.Button("Open /xllog Log Window##GPM_OpenXllog", new Vector2(-1, 30f)))
+        {
+            Plugin.CommandManager.ProcessCommand("/xllog");
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Executes /xllog to open the Dalamud log viewer window.");
+
+        ImGui.Spacing();
+
+        if (ImGui.Button("Dump Full State to /xllog##GPM_DumpState", new Vector2(-1, 30f)))
+        {
+            plugin.DumpStateToLog();
+            Plugin.ChatGui.Print("[GPM] Diagnostic state dumped to /xllog.");
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Writes a complete diagnostic dump of GPM and Glamourer reflection state into /xllog.");
+
+        ImGui.Spacing();
+
+        if (ImGui.Button("Force Re-bind Glamourer Reflection##GPM_ForceRebind", new Vector2(-1, 30f)))
+        {
+            plugin.ForceReinitializeReflection();
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Clears the reflection cache and immediately searches for Glamourer's ServiceManager and DesignFileSystem. Use this if Glamourer was reloaded, updated, or toggled in Dalamud.");
+
+        ImGui.Spacing();
+
+        if (ImGui.Button("Force Rescan Designs Directory##GPM_ForceRescan", new Vector2(-1, 30f)))
+        {
+            plugin.DesignManager.ScanDesigns();
+            Plugin.ChatGui.Print($"[GPM] Rescanned designs directory. Total designs found: {plugin.DesignManager.Designs.Count}");
+        }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Forces an immediate disk rescan of all Glamourer designs.");
+
         ImGui.Spacing();
     }
 }

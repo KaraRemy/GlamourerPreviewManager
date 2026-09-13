@@ -55,6 +55,90 @@ public class DesignManager : IDisposable
     public Dictionary<Guid, DesignInfo> DesignsById { get; private set; } = new();
     public Dictionary<string, List<DesignInfo>> DesignsByName { get; private set; } = new(StringComparer.OrdinalIgnoreCase);
 
+    private int lastAutoRescanFrame = -1;
+
+    public void TriggerAutoRescanDebounced()
+    {
+        int currentFrame = (int)Dalamud.Bindings.ImGui.ImGui.GetFrameCount();
+        if (lastAutoRescanFrame >= 0 && currentFrame - lastAutoRescanFrame < 180) return; // ~3 second throttle
+        lastAutoRescanFrame = currentFrame;
+
+        Task.Run(() =>
+        {
+            try
+            {
+                Plugin.LogDebug("[GPM] Auto-rescanning designs folder...");
+                ScanDesigns();
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogDebug($"[GPM] Auto-rescan failed: {ex.Message}");
+            }
+        });
+    }
+
+    public DesignInfo RegisterSynthesizedDesign(Guid id, string name, string? folder = null)
+    {
+        lock (scanLock)
+        {
+            if (DesignsById.TryGetValue(id, out var existing))
+            {
+                if (!string.IsNullOrEmpty(name) && existing.Name != name)
+                {
+                    existing.Name = name;
+                }
+                return existing;
+            }
+
+            var synthesized = new DesignInfo
+            {
+                Identifier = id,
+                Name = string.IsNullOrEmpty(name) ? "Unnamed Design" : name,
+                Description = string.Empty,
+                FileSystemFolder = folder ?? string.Empty
+            };
+
+            var previewsFolder = plugin.Configuration.PreviewsFolderPath;
+            if (!string.IsNullOrEmpty(previewsFolder) && Directory.Exists(previewsFolder))
+            {
+                if (Allocations.TryGetValue(id, out var imgFile))
+                {
+                    var imgPath = Path.Combine(previewsFolder, imgFile);
+                    if (File.Exists(imgPath))
+                    {
+                        synthesized.PreviewImagePath = imgPath;
+                    }
+                }
+                else
+                {
+                    var autoFilename = GeneratePreviewFilename(synthesized);
+                    var autoPath = Path.Combine(previewsFolder, autoFilename);
+                    if (File.Exists(autoPath))
+                    {
+                        synthesized.PreviewImagePath = autoPath;
+                        Allocations[id] = autoFilename;
+                        SaveAllocations();
+                    }
+                }
+            }
+
+            Designs.Add(synthesized);
+            DesignsById[id] = synthesized;
+            if (!DesignsByName.TryGetValue(synthesized.Name, out var list))
+            {
+                list = new List<DesignInfo>();
+                DesignsByName[synthesized.Name] = list;
+            }
+            if (!list.Contains(synthesized))
+            {
+                list.Add(synthesized);
+            }
+
+            Plugin.LogDebug($"[GPM] Registered synthesized in-memory design: '{synthesized.Name}' [{id}]");
+            return synthesized;
+        }
+    }
+
     public DesignManager(Plugin plugin)
     {
         this.plugin = plugin;
@@ -857,6 +941,11 @@ public class DesignManager : IDisposable
             if (DesignsById.TryGetValue(id, out var design))
             {
                 return design;
+            }
+
+            if (Designs.Count == 0)
+            {
+                TriggerAutoRescanDebounced();
             }
 
             // On-demand fallback: If a design was just saved or unindexed

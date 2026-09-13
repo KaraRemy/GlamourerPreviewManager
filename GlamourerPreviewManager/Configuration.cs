@@ -14,6 +14,16 @@ public enum CropAspect
     Aspect3_4
 }
 
+public enum GpmLogLevel
+{
+    None = 0,
+    Error = 1,
+    Warning = 2,
+    Information = 3,
+    Debug = 4,
+    Verbose = 5
+}
+
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
@@ -22,6 +32,13 @@ public class Configuration : IPluginConfiguration
     public string PreviewsFolderPath { get; set; } = string.Empty;
     public CropAspect CropOption { get; set; } = CropAspect.Aspect9_16;
     public int PreviewImageSizePercent { get; set; } = 100;
+
+    // Debugging & Logging settings
+    public GpmLogLevel LogLevel { get; set; } = GpmLogLevel.Information;
+    public bool PromoteDebugLogsToInformation { get; set; } = false;
+    public bool ShowDebugOverlayBelowPreview { get; set; } = false;
+    public bool LogSelectionChanges { get; set; } = false;
+    public bool LogHookEvents { get; set; } = false;
     
     // Screenshot settings
     public float ScreenshotScale { get; set; } = 1.0f;
